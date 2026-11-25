@@ -1,0 +1,123 @@
+# (fix190) Places matched by hand for Starfield 1.16.244 (tools/port/bake.py reads this; docs/PORTING.md). One per line:
+#   <1.16.236 rva> <1.16.244 rva> <the bytes there in 1.16.244, covering the code's longest checked run there> <the start of the
+#   1.16.244 function it is in>  # why
+# The tool checks the bytes and the function against the 1.16.244 exe (a few bytes alone are found in many places). Use this only
+# after reading the code in both exes: the place must do in 1.16.244 what the mod needs it for.
+
+# GrenadeHand's save watch (fix154): the save manager's task processor (1.16.236 0x1852AB0, 1.16.244 0x18501B0) reads the manager
+# (1.16.236 0x5E754A8, 1.16.244 0x5E6D6E8, which the tool finds by its references) into r15 in 1.16.236 and into r14 in 1.16.244 (also
+# kept on the stack), then tests its tasks at +0x50 the same way: the same flags (0x100, 0x200, tests of 2 and 4) in the same order.
+0x1852ac7 0x18501c4 4c8b35      0x18501b0  # mov r14, [the manager] (1.16.236: mov r15, ...); RipTarget(at, 7) is the manager in both
+0x1852ace 0x18501d3 41837e5000  0x18501b0  # cmp dword [r14+50h], 0 (1.16.236: [r15+50h], 7 bytes after the mov; here 15)
+
+# (fix191) LeftWeapon's and FavoritesWheel's places in the two functions 1.16.244 changed, matched by hand (read in both exes).
+#
+# The inventory's "item selected" worker (1.16.236 0x15E9090, 1.16.244 0x15E8080) and FavoritesManager::UseQuickkey (1.16.236 0x1EC2040,
+# 1.16.244 0x1EBF380): in both, 1.16.244 changed one thing only, the thread's counter both raise and lower (the thread-local block's
+# +0x278 is +0x27C in 1.16.244, and its +0x27C is +0x278: the two dwords swapped places; the review). Apart from
+# that immediate, each is the same length, the same instructions at the same distances (603 and 1237 bytes); its jumps inside it go
+# the same distances; its calls and data references go to the ports of the old ones (the equip 0x19A5C20 -> 0x19A3330, the handle's
+# form 0x2C5E90 -> 0x2C5870, the inventory lock 0x22CE9B0 -> 0x22CC350, the handles 0x5E68680 -> 0x5E608C0, as the table has them).
+# With only that immediate masked (and calls and rip-relative data), each is the one such function in either exe.
+# Its callers: the worker's sink 0x15E8FD0 -> 0x15E7FC0 (the same code; "call worker" at +0xAB in both) and its queued task's
+# "jmp worker" 0x15EE994 -> 0x15ED764; UseQuickkey's: the menu's sink 0x1EC4F10 -> 0x1EC2250 (the tool matched it: its call at +0xA
+# goes to 0x1EBF380), the hotkeys' 0x1EC1CB0+0x5F -> 0x1EBEFF0+0x5F and the queued "jmp" 0x1EC80EB -> 0x1EC53EB. Both moved as their
+# neighbours did (-0x1010 as the worker's sink; -0x2CC0 as the manager's constructor 0x1EC0B40 -> 0x1EBDE80 and the sink).
+# The mod's hooks read and write the same things there in both: the worker's frame (mov rbp,rsp; sub rsp,58h: the handle at [rbp+50h],
+# the form in rsi), UseQuickkey's (lea rbp,[rsp-1Fh]; sub rsp,88h: the handle at [rbp+67h], dil returned; r12 the thread block at
+# the hook, as the way out needs it).
+
+# The worker (LeftWeapon):
+0x15e9090 0x15e8080 40555356574154415541564157488bec4883ec584533e4448965588b19895d50  0x15e8080  # its start: the same 32 bytes (push rbp .. mov [rbp+50h],ebx)
+0x15e90e9 0x15e80d9 e892d7cdfe  0x15e8080  # +0x59: call the handle's form (0x2C5870, the port of 0x2C5E90), as in 1.16.236
+0x15e90ee 0x15e80de 488b75584885f60f84c401000066c74548010041bdbc000000  0x15e8080  # +0x5E: mov rsi,[rbp+58h] (the form found); test; je +0x1C4 (out); the same 25 bytes
+0x15e90fb 0x15e80eb 66c745480100  0x15e8080  # +0x6B: the hook's place, mov word [rbp+48h],1 (the form found, nothing done with it yet; before the counter is raised)
+0x15e9150 0x15e8140 e8ebb13b00  0x15e8080  # +0xC0: call the equip (0x19A3330, the port of 0x19A5C20), as in 1.16.236
+0x15e92bc 0x15e82ac 8b5d50488b0d  0x15e8080  # +0x22C: the skip's target, mov ebx,[rbp+50h] (after the counter is lowered; the handle let go after it)
+
+# UseQuickkey (LeftWeapon, FavoritesWheel):
+0x1ec2040 0x1ebf380 40555356574154415541564157488d6c24e14881ec880000000fb6fa4c8be9  0x1ebf380  # its start: the same 31 bytes (push rbp .. mov r13,rcx)
+0x1ec209d 0x1ebf3dd 498d9d400400004183bd38040000007c03488b1b488b1cfb4032ff837d67ff0f84b2020000  0x1ebf380  # +0x5D: the slot read (r13+440h, +438h) and the handle's test, the same 37 bytes (the je at the same distance)
+0x1ec20b5 0x1ebf3f5 4032ff837d67ff  0x1ebf380  # +0x75: the hook's place, xor dil,dil; cmp dword [rbp+67h],-1 (the handle known, nothing done with it yet)
+0x1ec2336 0x1ebf676 e8b53caeff  0x1ebf380  # +0x2F6: call the equip (0x19A3330, the port of 0x19A5C20), as in 1.16.236
+0x1ec24c7 0x1ebf807 488b0db210fa034885c97410837d67ff740a488d5567e8  0x1ebf380  # +0x487: every way out: mov rcx,[the handles] (0x5E608C0, the port of 0x5E68680; 1.16.236's bytes there have its old distance); test; je; cmp [rbp+67h],-1; je; lea rdx,[rbp+67h]; call (let go)
+
+# (fix191) Places matched by hand for Starfield 1.16.244: the VR tab (VrSettingsTab.cpp) and people physics (Physical.cpp). The format is
+# tools/port/manual_1_16_244.txt's: <1.16.236 rva> <1.16.244 rva> <the bytes there in 1.16.244> <the 1.16.244 function's start>  # why
+
+# The game's fixed strings (BSFixedString). Its release, 1.16.236 0x28CEF30, is 1.16.244 0x28CAEA0. Of the 27152 direct calls to the old
+# one, 631 were sampled across the exe in functions the tool matched for certain with the same bodies. Every one calls 0x28CAEA0 at the
+# same spot (among them KnockdownHandler's 0x1AEEEEF -> 0x1AEC28F, which Physical reads). The new exe has 27142 direct calls to it. Its body
+# is the same: [rcx] tested for 0, the entry's count dropped, the entry unlinked when the last one goes, [rcx] set to 0. Only its registers
+# (r12 for r13) and its lock's wait differ: the wait for its turn after the bucket's bit is taken (the ticket xadd, then the spin on
+# [lock+4]) is now 0x22CE5E0(lock, 0); the unlock is inline in both (the review). The mod
+# calls it as release(void** string), the same in both.
+0x28cef30 0x28caea0 41544883ec40488339004c8be1 0x28caea0  # push r12; sub rsp,40h; cmp qword [rcx],0; mov r12,rcx (1.16.236: r13)
+# Its make (out, text, case-sensitive), 1.16.236 0x28CFB80, is 1.16.244 0x28CBA80. Of the 14711 direct calls, 221 sampled in functions
+# matched for certain with the same bodies all go to 0x28CBA80 at the same spot (the new exe has 14710). Its body is the same: the text's
+# crc32 (case kept when r8b is set, else through tolower), and 0x3FFFF of it picks the bucket. The entry is looked up, else made, and
+# written to [out] ([rbp+67h], rcx's home); rax is the entry in both (the mod's call returns nothing). Its frame is smaller (sub rsp 98h, not 0B8h) and its locals are placed
+# elsewhere. The first 21 bytes the mod checks are the same as in 1.16.236.
+0x28cfb80 0x28cba80 4488442418488954241048894c2408555356574154415541564157488d6c24e1 0x28cba80  # its start through lea rbp,[rsp-1Fh]
+
+# The grab-the-living setting's read: the spring maker, 1.16.236 0x1A51A70 (4905 bytes), is 1.16.244 0x1A4F060 (4905 bytes). Its 950
+# instructions are the same; only its rip distances and calls differ. The tool missed it because capstone gives one instruction (vpor
+# xmm1,xmm2,[rip+X] at +0xF8A) a 2-byte displacement, so it was not masked. Its 4 callers (0x1786630 twice, 0x1A4DFA0, 0x1A50600), matched
+# for certain, call 0x1A4F060 at the same spots. At +0xE2 both read the setting's value: 1.16.236 [0x5F4E550], 1.16.244 [0x5F467B0]. That is
+# bAllowHavokGrabTheLiving 0x5F4E548 -> 0x5F467A8 (the tool's port) + 8, which the mod checks with RipTarget(at, 2, 6) == setting + 8.
+0x1a51b52 0x1a4f142 381d68764f047551 0x1a4f060  # cmp [the setting's value],bl; jne (the same distance)
+
+# The seat queue's steps: the game's "stop interacting" around a person, 1.16.236 0x12D5100 (6053 bytes), is 1.16.244 0x12D4B20 (6053
+# bytes). Its 1402 instructions are the same but for two: the per-thread block's counter raised at its start and lowered at its end,
+# mov eax,278h, is mov eax,27Ch (1.16.244 moved that counter everywhere). That counter is not part of the queued steps the mod copies.
+# Every place is 0x5E0 before its 1.16.236 one and does the same step. The block's offsets the mod uses are the same in 1.16.244: +0xBC
+# (ready) and +0x1D4 (context), here, in the context's set (0x2CC160, the one function alike) and in the block's ready-maker. As offsets loaded
+# near the block's 12192 reads in the whole exe they appear 9519 and 6841 times (1.16.236: 9521 and 6843 of 12195); only +0x278 and +0x27C
+# changed: they swapped places (51 -> 10 there, +0x27C 9 -> 50). The same 0x55 is set. The command is taken with
+# (buffer [[queue]], &cookie, 18h, 8). The alloc writes 16 bytes of cookie in both. The command is {type table, run, the handle qword
+# [rsp+78h]}, and commit gets &{buffer, &cookie}.
+0x12d6594 0x12d5fb4 488b356db7b904 0x12d4b20  # mov rsi,[task queue]: 0x5E71728 in 1.16.244, the same global PushActorAway's code loads there (0x207DBEA), as in 1.16.236 (0x5E794E8)
+0x12d6623 0x12d6043 41bfbc00000043803c3c007505 0x12d4b20  # mov r15d,0BCh; cmp byte [r12+r15],0; jne (the block's ready flag)
+0x12d6630 0x12d6050 e833743802 0x12d4b20  # call 0x365D488: the block made ready (1.16.236 0x3661188; same bytes, tail jump to 0x365D420, the same TLS initializer)
+0x12d6635 0x12d6055 b8d4010000428b1c20 0x12d4b20  # mov eax,1D4h; mov ebx,[rax+r12] (the context saved)
+0x12d6647 0x12d6067 e8f460fffe 0x12d4b20  # call 0x2CC160: the context set (1.16.236 0x2CC8B0; the one function alike, writes +0x1D4)
+0x12d6676 0x12d6096 e8c57eff00 0x12d4b20  # call 0x22CDF60: the command taken (1.16.236 0x22D05A0; the one function alike)
+0x12d667b 0x12d609b 488d0d3e695f0048894808 0x12d4b20  # lea rcx,[run]; mov [rax+8],rcx: 0x18CC9E0, the tool's port of the run 0x18CF1F0
+0x12d6686 0x12d60a6 488d0dfbfe9d03488908 0x12d4b20  # lea rcx,[type table]; mov [rax],rcx: 0x4CB5FA8, the same RTTI TCmd<lambda_e2add6adb287b8a88ba9ca51828c2086> as 0x4CBA048, its 3 slots alike
+0x12d66a0 0x12d60c0 e87b9d07ff 0x12d4b20  # call 0x34FE40: committed (1.16.236 0x3503B0; the one function alike)
+
+# (fix191) GloveHighlight, HandGrab and PhysicsProbe: places in functions the tool did not match in 1.16.244, read by hand in both exes.
+# Format as tools/port/manual_1_16_244.txt: <1.16.236 rva> <1.16.244 rva> <the 1.16.244 bytes there> <the 1.16.244 function start>  # why
+#
+# Why the tool missed the scanner's and the collision object's functions: they did not change. Each is the same length with the same
+# instructions in the same order in both exes; only call distances and data references differ. But each has a vpand, vpxor or vpor
+# with a rip-relative operand, and capstone 5.0.7 gives those VEX instructions a disp_size of 2 (not 4), so the tool does not mask
+# their distance and sees a change. (The equip function, below, has one real change.)
+#
+# The hand scanner's marking function (1.16.236 0x17D7630, 1.16.244 0x17D4CD0; 573 bytes in both, 135 instructions, 119 the same
+# bytes, the other 16 differ only in rip-relative and image-relative data references and calls). Its neighbours 0x17D7490 and
+# 0x17D7870 moved by 0x2960 (both matched by the tool, one of a kind); its one caller, 0x17D7C10 -> 0x17D52B0 (one of a kind), calls
+# 0x17D4CD0 at the same spot. The ten references to the mark visitor's type table (0x4B33A48 -> 0x4B2FA10, as the tool found) are at
+# the same places in both, this one included, and that table's slots go to the ports of the old slots' functions. The second
+# visitor (the unmarking one, 0x4B33A28 -> 0x4B2F9F0) matches the same way. The walk it calls is 0x241A660 -> 0x24181E0 in the table.
+# The visitor is built on the stack the same way: the manager at rsp+0x40, its key ([rcx+0x40]) at rsp+0x48, the table at rsp+0x50,
+# &captures at rsp+0x58, then rdx = the 3D (rsi), rcx = &visitor, call the walk.
+0x17d775f 0x17d4dff 488d050aac35034889442450488d4424404889442458488bd6488d4c2450e8be33c400  0x17d4cd0  # lea rax,[the mark visitor] ... call the walk (0x24181E0): the scanner marks an object, as in 1.16.236
+0x17d777d 0x17d4e1d e8be33c400  0x17d4cd0  # call the walk (0x24181E0, the walk's port): the same call, 0x1E after the lea in both
+#
+# The collision object's world update (bhkNPCollisionObject's type table slot 56; 1.16.236 0x23781C0, 1.16.244 0x2375B90; 2135 bytes
+# in both, 467 instructions, 427 the same bytes, the other 40 differ only in data references and calls; every constant they read is
+# the same, its one string is "%u < %u" in both and its one import WakeByAddressSingle in both). Slot 56 of bhkNPCollisionObject's,
+# bhkNPCollisionObjectUnlinked's, bhkCharacterController's, bhkCharProxyController's and PoseBoundCollisionObject's type tables
+# points to it in both (by their RTTI names). Its neighbours
+# 0x2378150 and 0x2378A20 moved by 0x2630 (one of a kind). The scene writer (0x237CB20 -> 0x237A4F0, matched by the tool) has two
+# callers in both, this function's call at the same offset (+0x487) included.
+0x237863a 0x237600a 488d95c0000000498bcec5f877e8d4440000  0x2375b90  # lea rdx,[rbp+0xC0] (the transform); mov rcx,r14 (the collision object); vzeroupper; call the writer (0x237A4F0); returns to 0x237601C
+#
+# PhysicsProbe (a developer probe, off by default): these functions' starts are only saved (read) to its dump.
+0x23781c0 0x2375b90 488bc448895808488970184889782048895010554154415541564157  0x2375b90  # the collision object's world update (above)
+# The game's equip (1.16.236 0x19667D0, 1.16.244 0x1963F20; 1236 bytes in both, 322 instructions in the same order). Its one caller,
+# script EquipItem's task (0x18CB2E0 -> 0x18C8AD0, one of a kind), calls it at the same spot; its neighbours 0x1966610 and 0x1966CB0
+# moved by 0x28B0. Apart from data references and calls, two instructions differ: a thread-local counter's offset raised at +0x5F and
+# lowered at +0x4B1 (0x278 -> 0x27C: two of the block's dwords swapped places). Only read by the probe.
+0x19667d0 0x1963f20 48895c24185556574154415541564157488d6c24d94881ece0000000  0x1963f20  # the game's equip: its start
