@@ -606,6 +606,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     picture_path.string(), (uint32_t)hr_picture);
             }
             bool frozen_ok = false;
+            bool frozen_left_out_now = false; // (fix200: the world as it was left out for VectorXR's Frame Generation, below)
             const bool live_ok = panel_ok && see_through && live_pair;
             const bool live_shown = live_ok || (panel_ok && see_through && live_hold);
             if (live_shown != m_live.was_live) {
@@ -659,8 +660,22 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const int f = history.frozen;
                 // (fix183) Not behind the star map: opened in space, the world as it was is mostly black space (black showed outside of
                 // the background); the soft light round the panel instead (below).
-                if (f >= 0 && history.order[f] != 0 && vr->m_openxr->panel_backdrop.load() != 0 && vr->m_openxr->panel_world_allowed &&
-                    !vr->m_openxr->panel_glow_when_empty) {
+                const bool as_it_was_wanted = f >= 0 && history.order[f] != 0 && vr->m_openxr->panel_backdrop.load() != 0 &&
+                                              vr->m_openxr->panel_world_allowed && !vr->m_openxr->panel_glow_when_empty;
+                // (fix200) While VectorXR's Frame Generation may run, the world as it was is not shown: its picture would have to be the
+                // first layer (Frame Generation must never find the empty layer in front of a picture copied every frame), and Virtual
+                // Desktop would then put the whole frame together from where your head was before the menu, so the panel would move with
+                // your head for as long as the menu is open. Behind the panel is then what the main menu has (the soft light, or
+                // darkness), with the empty layer first and no world's picture: a layout Frame Generation already ran with. (The last
+                // live picture shown again for a moment, above, stays: it is at most 45 frames old, so the panel can only move a little,
+                // and only for that moment.)
+                frozen_left_out_now = as_it_was_wanted && runtimes::OpenXR::vectorxr_framegen.load();
+                if (frozen_left_out_now && !vr->m_openxr->frozen_left_out_logged) {
+                    vr->m_openxr->frozen_left_out_logged = true;
+                    spdlog::info("[VR] (fix200) Menu panel: VectorXR's Frame Generation may run this session, so the world as it was is not "
+                                 "shown behind a menu: what the main menu has instead (the soft light, or darkness), the panel kept still");
+                }
+                if (as_it_was_wanted && !frozen_left_out_now) {
                     auto& left = m_openvr.left_eye_tex[f];
                     auto& right = history.mono[f] ? m_openvr.left_eye_tex[f] : m_openvr.right_eye_tex[f];
                     if (left.texture != nullptr && right.texture != nullptr) {
@@ -683,15 +698,17 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // darkness in the game.
             // (Only where there is no world at all: never in play behind an opaque menu with no world kept; off at strength 0; the review.)
             // (fix183) And the star map (its surface map too): the world as it was is not shown behind it (above), the light instead.
+            // (fix200) And where the world as it was was left out for VectorXR's Frame Generation (above): as at the main menu.
             const bool ambient_wanted = panel_ok && !see_through && !live_shown && !frozen_ok && vr->m_openxr->panel_ambient.load() &&
                                         !vr->m_openxr->ambient_refused &&
-                                        (!vr->m_openxr->panel_world_allowed || vr->m_openxr->panel_glow_when_empty) &&
+                                        (!vr->m_openxr->panel_world_allowed || vr->m_openxr->panel_glow_when_empty || frozen_left_out_now) &&
                                         vr->m_openxr->panel_ambient_strength.load() >= 0.01f;
             vr->m_openxr->ambient_ready = ambient_wanted && present_ambient(vr, eye_texture.Get(), command_queue);
             if (!ambient_wanted) {
                 m_ambient.was_on = false; // (started anew, faded in again, when it comes back)
             }
             vr->m_openxr->frozen_ready = frozen_ok;
+            vr->m_openxr->frozen_left_out = frozen_left_out_now; // (fix200)
             vr->m_openxr->live_world_ready = live_ok;
         }
     } else if (aer) {
@@ -867,8 +884,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // The strip of small pictures (the gun sight's, the menu panel's veil, beam and dot), made the first time it is shown:
     // copied into the runtime's images as the eye pictures just were, at the same point of the frame (begun, the eye images
     // filled).
+    // (fix196: also for the mod's own menu (F11), whose pointer's beam is the strip's.)
     if ((mono || native || aer || present_eye == VRRuntime::Eye::RIGHT) && openxr_ready && vr->m_openxr->frame_began &&
-        (vr->m_openxr->reticle_visible.load() || panel)) {
+        (vr->m_openxr->reticle_visible.load() || panel || g_framework->is_drawing_ui())) {
         m_openxr.ensure_reticle();
     }
     // (fix145) The conversation's panel's image (record_conversation's cut), as the eye images were just filled; not with the menu panel up.
@@ -883,6 +901,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         // (fix171) The favorites wheel's newest picture into its swapchain (only when one came while it is open: the game side closes it as a
         // menu opens, and end_frame never shows it with the menu panel up).
         present_wheel(vr);
+        // (fix196) The mod's own menu's picture into its swapchain (with the menu panel up too: it is shown over it).
+        present_fw_menu(vr);
     }
 
     vr::EVRCompositorError e = vr::EVRCompositorError::VRCompositorError_None;
@@ -3000,6 +3020,170 @@ void D3D12Component::OpenXR::destroy_console() {
         openxr->console_image_width = 0;
         openxr->console_image_height = 0;
         openxr->console_image_ready = false;
+    }
+}
+
+void D3D12Component::present_fw_menu(VR* vr) {
+    auto xr = vr->m_openxr; // (a copy: it may be made anew on another thread)
+    if (xr == nullptr || g_framework == nullptr) {
+        return;
+    }
+    xr->fw_menu_image_ready = false;
+    // (The framework's settings and placing asks, passed on each headset frame: end_frame reads them.)
+    xr->fw_menu_height_m = g_framework->headset_menu_height();
+    xr->fw_menu_distance_m = g_framework->headset_menu_distance();
+    xr->fw_menu_place_serial = g_framework->headset_menu_place_serial();
+    xr->fw_menu_hand = g_framework->headset_menu_hand();
+    ID3D12Resource* src = g_framework->headset_menu_texture();
+    const auto now = std::chrono::steady_clock::now();
+    if (src == nullptr) {
+        // (Not drawn so for 20 s: its swapchain let go; made again at the next opening.)
+        if (xr->fw_menu_swapchain != XR_NULL_HANDLE && now - m_fw_menu_last > std::chrono::seconds(20)) {
+            m_openxr.destroy_fw_menu();
+            spdlog::info("[VR] (fix196) The mod's menu: its panel's images let go (not drawn for 20 s)");
+        }
+        return;
+    }
+    m_fw_menu_last = now;
+    xr->fw_menu_image_ready = m_openxr.copy_fw_menu(src);
+}
+
+bool D3D12Component::OpenXR::copy_fw_menu(ID3D12Resource* src) {
+    std::scoped_lock _{this->mtx};
+
+    auto& vr = VR::get();
+    auto& openxr = vr->m_openxr;
+    if (src == nullptr || openxr == nullptr || openxr->session == XR_NULL_HANDLE || openxr->frame_state.shouldRender != XR_TRUE) {
+        return false;
+    }
+    if (!openxr->frame_began && openxr->get_synchronize_stage() != VRRuntime::SynchronizeStage::VERY_LATE) {
+        return false;
+    }
+    // Its swapchain: the size of the framework's picture (a copy needs both alike), made again when that changes (as the console's). The
+    // picture is 8-bit RGBA, stored as sRGB as the game's picture is (the framework draws it only for such a backbuffer).
+    const auto src_desc = src->GetDesc();
+    const auto width = (uint32_t)src_desc.Width;
+    const auto height = (uint32_t)src_desc.Height;
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (openxr->fw_menu_swapchain == XR_NULL_HANDLE || this->fw_menu_resolution[0] != width || this->fw_menu_resolution[1] != height) {
+        if (this->fw_menu_failed_resolution[0] == width && this->fw_menu_failed_resolution[1] == height &&
+            std::chrono::steady_clock::now() - this->fw_menu_failed_time < std::chrono::seconds(3)) {
+            return false;
+        }
+        this->destroy_fw_menu();
+
+        const auto fail = [&](const char* what, XrResult result, XrSwapchain made) {
+            spdlog::error("[VR] (fix196) The mod's menu: {} failed ({}) for {}x{}", what, openxr->get_result_string(result), width, height);
+            this->fw_menu_context.texture_contexts.clear();
+            this->fw_menu_context.textures.clear();
+            if (made != XR_NULL_HANDLE) {
+                xrDestroySwapchain(made);
+            }
+            this->fw_menu_failed_resolution = {width, height};
+            this->fw_menu_failed_time = std::chrono::steady_clock::now();
+            // (Three times in a row: the framework draws the menu into the game's picture again for the rest of the session, rather than
+            // the menu showing nowhere in the headset.)
+            if (++this->fw_menu_create_failures >= 3 && !openxr->fw_menu_refused.exchange(true)) {
+                spdlog::warn("[VR] (fix196) The mod's menu: its panel's images could not be made three times; it is drawn into the game's picture "
+                             "from now on");
+            }
+            return false;
+        };
+
+        XrSwapchainCreateInfo create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        create_info.arraySize = 1;
+        create_info.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        create_info.width = width;
+        create_info.height = height;
+        create_info.mipCount = 1;
+        create_info.faceCount = 1;
+        create_info.sampleCount = 1;
+        create_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        XrSwapchain handle{XR_NULL_HANDLE};
+        if (const auto result = xrCreateSwapchain(openxr->session, &create_info, &handle); result != XR_SUCCESS) {
+            return fail("xrCreateSwapchain", result, XR_NULL_HANDLE);
+        }
+        uint32_t image_count{};
+        if (const auto result = xrEnumerateSwapchainImages(handle, 0, &image_count, nullptr); result != XR_SUCCESS || image_count == 0 || image_count > 8) {
+            return fail("xrEnumerateSwapchainImages", result, handle);
+        }
+        auto& ctx = this->fw_menu_context;
+        ctx.textures.assign(image_count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        ctx.texture_contexts.clear();
+        ctx.texture_contexts.resize(image_count);
+        for (uint32_t j = 0; j < image_count; ++j) {
+            ctx.texture_contexts[j] = std::make_unique<d3d12::TextureContext>();
+            ctx.texture_contexts[j]->commands.setup((std::wstring{L"OpenXR Mod Menu Commands "} + std::to_wstring(j)).c_str());
+        }
+        if (const auto result = xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)ctx.textures.data());
+            result != XR_SUCCESS) {
+            return fail("xrEnumerateSwapchainImages (the images)", result, handle);
+        }
+        ctx.num_textures_acquired = 0;
+        openxr->fw_menu_swapchain = handle;
+        openxr->fw_menu_image_width = (int32_t)width;
+        openxr->fw_menu_image_height = (int32_t)height;
+        this->fw_menu_resolution = {width, height};
+        this->fw_menu_failed_resolution = {};
+        this->fw_menu_create_failures = 0;
+        spdlog::info("[VR] (fix196) The mod's menu: its panel's image is {}x{} ({} images, {:.1f} MB)", width, height, image_count,
+            width * (double)height * 4.0 * image_count / 1048576.0);
+    }
+
+    auto& ctx = this->fw_menu_context;
+    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t index{};
+    if (const auto result = xrAcquireSwapchainImage(openxr->fw_menu_swapchain, &acquire_info, &index); result != XR_SUCCESS) {
+        static int logged = 0;
+        if (logged++ < 10) {
+            spdlog::error("[VR] (fix196) The mod's menu: xrAcquireSwapchainImage failed: {}", openxr->get_result_string(result));
+        }
+        return false;
+    }
+    if (index >= ctx.textures.size() || index >= ctx.texture_contexts.size()) {
+        spdlog::error("[VR] (fix196) The mod's menu: the runtime gave image {} of {}; its images are made again", index, ctx.textures.size());
+        this->destroy_fw_menu();
+        return false;
+    }
+    XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait_info.timeout = XR_INFINITE_DURATION;
+    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    if (const auto result = xrWaitSwapchainImage(openxr->fw_menu_swapchain, &wait_info); result != XR_SUCCESS) {
+        spdlog::error("[VR] (fix196) The mod's menu: xrWaitSwapchainImage failed: {}; its images are made again", openxr->get_result_string(result));
+        this->destroy_fw_menu();
+        return false;
+    }
+    // (The framework's picture rests in the common state: drawn on the same queue just before, so this copy follows it.)
+    auto& texture_ctx = ctx.texture_contexts[index];
+    texture_ctx->commands.wait(INFINITE);
+    texture_ctx->commands.copy(src, ctx.textures[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    texture_ctx->commands.execute();
+    if (const auto result = xrReleaseSwapchainImage(openxr->fw_menu_swapchain, &release_info); result != XR_SUCCESS) {
+        spdlog::error("[VR] (fix196) The mod's menu: xrReleaseSwapchainImage failed: {}; its images are made again", openxr->get_result_string(result));
+        this->destroy_fw_menu();
+        return false;
+    }
+    return true;
+}
+
+void D3D12Component::OpenXR::destroy_fw_menu() {
+    std::scoped_lock _{this->mtx};
+
+    this->fw_menu_context.texture_contexts.clear(); // (waits for each image's last copy)
+    this->fw_menu_context.textures.clear();
+    this->fw_menu_context.num_textures_acquired = 0;
+    this->fw_menu_resolution = {};
+    auto& openxr = VR::get()->m_openxr;
+    if (openxr != nullptr) {
+        if (openxr->fw_menu_swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(openxr->fw_menu_swapchain);
+        }
+        openxr->fw_menu_swapchain = XR_NULL_HANDLE;
+        openxr->fw_menu_image_width = 0;
+        openxr->fw_menu_image_height = 0;
+        openxr->fw_menu_image_ready = false;
     }
 }
 

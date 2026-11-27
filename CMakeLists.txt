@@ -51,7 +51,8 @@ file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
 )
 
-add_library(${PROJECT_NAME} SHARED ${headers} ${sources})
+# (fix193) src/version.rc: the dll's version information (product Starfield2VR, the game version it is built for).
+add_library(${PROJECT_NAME} SHARED ${headers} ${sources} ${CMAKE_CURRENT_SOURCE_DIR}/src/version.rc)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 #target_compile_definitions(common INTERFACE MOTION_VECTOR_REPROJECTION)

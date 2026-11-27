@@ -384,6 +384,40 @@ public:
     // Virtual Desktop: an empty layer with this frame's head position sent first (VDFix in the log; as UEVR's "Virtual Desktop Fix").
     std::atomic<bool> vd_fix{true};
     bool vd_fix_logged{false};
+    // (fix197) In play its empty layer is left out when the world's picture is already first with the same poses; counted for the log.
+    bool vd_fix_skip_logged{false};
+    // (fix200) Behind a menu too, when the world as it is now is first with this frame's poses; and never before the world's picture while
+    // VectorXR's Frame Generation may run (vectorxr_framegen): logged once each.
+    bool vd_fix_menu_skip_logged{false};
+    bool vd_fix_vectorxr_logged{false};
+    // (fix200) Which way each frame went, counted for the minute's log line (VdFixWay). The order matters: the ways from
+    // vd_sent_menu_no_world on send the empty layer, those up to vd_sent_menu_pose are behind a menu.
+    enum VdFixWay : int {
+        vd_left_out_play = 0,      // left out: the world first with this frame's poses (in play, or before a menu's panel is ready, fix197)
+        vd_left_out_menu,          // left out: behind a menu, the world as it is now first with this frame's poses
+        vd_left_out_vectorxr_menu, // left out for VectorXR's Frame Generation: behind a menu (the last live picture again, drawn in, a pose differed)
+        vd_left_out_vectorxr_play, // left out for VectorXR's Frame Generation: elsewhere (a pose differed, or the world not first)
+        vd_sent_menu_no_world,     // sent: behind a menu with no world (the main menu, a loading screen, darkness)
+        vd_sent_menu_world_left_out, // sent: behind a menu, the world as it was left out for VectorXR's Frame Generation (the main menu's layout)
+        vd_sent_menu_as_it_was,    // sent: behind a menu, the world as it was
+        vd_sent_menu_drawn_in,     // sent: the menu drawn into the world's pictures
+        vd_sent_menu_pose,         // sent: behind a menu, the world as it is now, a pose differed
+        vd_sent_flat_screen,       // sent: the flat screen (no world's picture)
+        vd_sent_play_not_first,    // sent: the world not first, or none
+        vd_sent_play_pose,         // sent: the world first, a pose differed
+        vd_ways
+    };
+    std::array<uint32_t, vd_ways> vd_fix_ways{};
+    int vd_fix_count_logs{0};
+    // (fix200) VectorXR's layer is loaded and its Frame Generation may run this session. Set as each instance is made, from whether its
+    // layer is there (VR::initialize_openxr: the loader's list, or its library loaded in the game); cleared only when its status file (ours,
+    // current, of a session first seen after that instance was made) says Frame Generation is off for this game; set again when one says
+    // it is on in any state. Static: kept while the instance and its sessions are made anew.
+    static inline std::atomic<bool> vectorxr_framegen{false};
+    // (fix200) This frame (the graphics side): the world as it was (an opaque menu's, from before it opened) was not copied into the eye
+    // images because VectorXR's Frame Generation may run: behind the panel is then what the main menu has (no world's picture).
+    bool frozen_left_out{false};
+    bool frozen_left_out_logged{false};
     std::atomic<float> panel_distance{1.5f};       // metres from your head to the panel
     std::atomic<float> panel_width{1.8f};          // metres
     std::atomic<float> panel_height_offset{-0.1f}; // its middle against your eyes' height, metres
@@ -733,6 +767,52 @@ public:
     std::atomic<bool> console_refused{false};
     int console_logs{0};
     std::atomic<uint32_t> console_dropped{0}; // (its quads left out of frames: the runtime's layer limit)
+    // (fix196) The mod's own menu (F11) on a panel of its own: the framework draws it into a picture of its own (not the game's), the
+    // graphics side copies that into this swapchain each frame the menu is open (fw_menu_image_ready), and end_frame shows it as a quad
+    // fixed in the room (stage space), over everything else, in both eyes whatever the eye mode. It is put in front of you each time the
+    // menu opens (fw_menu_place_serial, from the framework), when you recenter (fw_menu_recenter), and stays there while it is open; its
+    // size in metres (its height; its width from the picture's shape) and its distance come from the framework's settings.
+    XrSwapchain fw_menu_swapchain{XR_NULL_HANDLE};
+    int32_t fw_menu_image_width{0};
+    int32_t fw_menu_image_height{0};
+    bool fw_menu_image_ready{false}; // (the graphics side, this frame: its image filled)
+    std::atomic<float> fw_menu_height_m{1.1f};
+    std::atomic<float> fw_menu_distance_m{1.75f};
+    std::atomic<uint32_t> fw_menu_place_serial{0};
+    std::atomic<bool> fw_menu_recenter{false};
+    // (The hand the framework takes as pointing, for its beam: -1 none yet.)
+    std::atomic<int> fw_menu_hand{-1};
+    bool fw_menu_placed{false};
+    uint32_t fw_menu_placed_serial{0};
+    float fw_menu_yaw{0.0f};
+    float fw_menu_head[3]{};
+    std::chrono::steady_clock::time_point fw_menu_replace_until{};
+    std::chrono::steady_clock::time_point fw_menu_last_shown{}; // (not shown for 2 s: put in front of you again when it next shows)
+    int fw_menu_place_logs{0};
+    int fw_menu_logs{0};
+    // Frames refused with it three times (without the strip's layers: then it is what was refused): not shown again this session (the
+    // framework then draws the menu into the game's picture, as before fix196).
+    int fw_menu_refusals{0};
+    std::atomic<bool> fw_menu_refused{false};
+    // Shown in the last frame submitted (for the graphics side: the strip's pictures made for its beam).
+    std::atomic<bool> fw_menu_visible{false};
+    // When a frame with it was last taken by the runtime (steady clock, ms): the framework draws the menu into the game's picture again
+    // for the rest of an opening in which it has not reached the headset for a second.
+    std::atomic<int64_t> fw_menu_submitted_ms{0};
+    // Where each controller's aim meets it (u across, v down, 0..1 over its picture), for the framework's mouse: pointer_mtx.
+    struct FwMenuPointer {
+        bool shown{false}; // shown on the last frame
+        bool hit[2]{false, false};
+        float u[2]{}, v[2]{};
+        std::chrono::steady_clock::time_point at{};
+    };
+    FwMenuPointer fw_menu_pointer{};
+    FwMenuPointer get_fw_menu_pointer() {
+        std::scoped_lock _{this->pointer_mtx};
+        return this->fw_menu_pointer;
+    }
+    // Puts it in front of you when needed (false: not placed, no head pose yet).
+    bool place_fw_menu();
     // (fix177) The most layers the runtime takes in a frame (its system properties; 16 at least by the standard).
     uint32_t max_layers{16};
     // Diagnostics.

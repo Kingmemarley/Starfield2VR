@@ -53,6 +53,13 @@ namespace VrSettingsTab
         std::function<bool()>             enabled;       // empty: always usable
         std::function<void()>             apply;         // after a change: the mod's settings set from the value
         bool                              rebuild{ false }; // other rows are usable or not with it: the tab built again after a change
+        // (fix198) A stepper over no one setting (the eye mode: three switches): its choice now, and the choice made (false: refused, the
+        // row shown again as it is); put back to its default by the tab's Defaults. And a description worked out each time the tab is built
+        // (a refusal's reason, for one).
+        std::function<uint32_t()>         get_index;
+        std::function<bool(uint32_t)>     set_index;
+        std::function<void()>             reset;
+        std::function<std::string()>      describe;
     };
 
     // (The mod's start, before Install) The rows of the tab, in order; their ids follow (0x7C0 + their place).
@@ -60,4 +67,9 @@ namespace VrSettingsTab
     // Checks the game's code and hooks the tabs' and rows' builds and the change handlers.
     void Install();
     std::string Status();
+    // (fix198) The tab is in the game's Settings (its hooks in place): the main VR settings are there, not on the F11 menu's Main tab.
+    bool Working();
+    // (fix198, the review) Our tab's rows asked for again, as a changed row asks for them: only within 2 s of a change and on the thread
+    // that change came on (else nothing).
+    void RequestRowsAgain();
 }

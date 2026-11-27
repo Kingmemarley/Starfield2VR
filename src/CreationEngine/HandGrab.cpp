@@ -6965,8 +6965,8 @@ namespace HandGrab
             if ((unknown && now_us - last_us > 10'000'000) || (!unknown && told < 3)) {
                 last_us = now_us;
                 ++told;
-                spdlog::info("[Grab] {} grip: your weapon is out ({}), so it does not grab or pull; hold reload (the left controller's upper button) "
-                             "to put it away",
+                spdlog::info("[Grab] {} grip: your weapon is out ({}), so it does not grab or pull; hold the reload button (fix194: X as printed, "
+                             "Y in the old layout) to put it away",
                     pressed[0] ? "left" : "right", what);
             }
         }

@@ -1,6 +1,7 @@
 // vrcore - extra VR display options (virtual screen used for menus and flat-screen mode).
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,7 +14,8 @@ public:
 
     [[nodiscard]] std::string_view get_name() const override { return "VRConfig"; }
 
-    void on_draw_ui() override;
+    void on_draw_advanced_ui(int part) override; // (fix196: the game menus' panel and the virtual screen)
+    void on_draw_debug_ui() override;    // (fix196: the pointer's status lines and Troubleshooting)
     void on_frame() override;
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
     void on_config_save(utility::Config& cfg) override;
@@ -23,6 +25,14 @@ public:
 
     // A line about the menu pointer for the menu (set by the game side).
     static inline std::function<std::string()> s_pointer_status{};
+    // (fix198) The game's own Settings > VR tab works (set by the game side once it is installed): the main VR settings are there, and
+    // the F11 menu's Main tab keeps only what concerns itself; else they stay on Main.
+    static inline std::atomic<bool> s_game_vr_tab{false};
+    // (fix198, the review) Set by the F11 menu only while its Advanced tab draws the "Main VR settings" group (with "Show the main VR
+    // settings here too" on): the mods then draw the rows that are in the game's tab otherwise.
+    static inline std::atomic<bool> s_main_rows_here{false};
+    // The main rows are in the game's Settings > VR tab, not to be drawn here now.
+    static bool main_rows_in_game_tab() { return s_game_vr_tab.load() && !s_main_rows_here.load(); }
 
 private:
     const ModSlider::Ptr m_flat_screen_distance{ModSlider::create(generate_name("FlatScreenDistance"), 0.5f, 10.0f, 1.6f)};

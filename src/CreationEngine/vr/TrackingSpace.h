@@ -72,6 +72,20 @@ namespace tracking
     // (fix185) The camera root's place as the game last worked it out and your character's place at that moment (game world); false
     // before the first. For where the game has your eyes from your feet (climbing's view tied to you).
     bool LastRootWrite(glm::vec3& root, glm::vec3& you);
+    // (fix195, the game's thread: every node's world update, before the game's; after Climbing's) "Tie the view to the body": in first
+    // person on foot the camera root is put exactly where CameraRootPlace told the body (and the gun in its hand) this frame, so the
+    // view and the gun come from one place. One pointer compared for every other node.
+    void BeforeNodeUpdate(RE::NiAVObject* obj);
+    // (fix195) The room's turn as it will be this frame. The camera hook sets the room later in the frame than the body places its
+    // hands, so while you turn with the stick the hands were placed with the frame before's turn. This is the frame before's turned on
+    // by your character's heading change since, once that has measured closer to the room the hook then sets than the frame before's
+    // alone (checked every frame; the frame before's until then). Only from the frame just before's room and for a stick turn's frame (a
+    // snap turn shows from the next frame, as before). The room as it is once the hook has set it this frame.
+    std::optional<glm::mat3> RoomRotationNow();
+    // (fix195, the camera hook, right after SetRoomRotation) The heading the room was just worked out from: your character's (+0x88)
+    // as the hook leaves it, less a snap turn the hook added after working out the camera (that one shows from the next frame on).
+    // `carry` false: the next frame's room is not carried on (a snap turn this frame, a conversation; the second review).
+    void NoteRoomHeading(float heading, bool carry);
 
     // Room orientation (game world, column-vector) maintained by the camera rotation hook. It stays
     // fixed while only the head turns and changes with snap or game turning.

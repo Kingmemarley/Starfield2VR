@@ -279,6 +279,10 @@ private:
         // each frame it came (a copy, nothing drawn, as the conversation's). Let go a while after build mode (present_console).
         bool copy_console(ID3D12Resource* src);
         void destroy_console();
+        // (fix196) The mod's own menu's swapchain (OpenXR::fw_menu_swapchain), the size of the framework's picture of it, filled with it each
+        // headset frame the menu is open (a copy, nothing drawn, as the console's).
+        bool copy_fw_menu(ID3D12Resource* src);
+        void destroy_fw_menu();
         std::vector<XrSwapchainImageD3D12KHR> wheel_textures{};
         d3d12::CommandContext wheel_commands{};
         bool wheel_commands_ready{false};
@@ -313,6 +317,11 @@ private:
         std::array<uint32_t, 2> console_resolution{};
         std::array<uint32_t, 2> console_failed_resolution{};
         std::chrono::steady_clock::time_point console_failed_time{};
+        SwapchainContext fw_menu_context{}; // (fix196)
+        std::array<uint32_t, 2> fw_menu_resolution{};
+        std::array<uint32_t, 2> fw_menu_failed_resolution{};
+        std::chrono::steady_clock::time_point fw_menu_failed_time{};
+        int fw_menu_create_failures{0}; // (three in a row: the menu goes back into the game's picture this session, OpenXR::fw_menu_refused)
         SwapchainContext ambient_context{}; // (fix164)
         std::array<uint32_t, 2> ambient_resolution{};
         std::chrono::steady_clock::time_point ambient_failed_time{}; // (could not be made: tried again a few seconds on)
@@ -531,6 +540,11 @@ private:
     // (fix171) The favorites wheel's picture (the game side's newest, OpenXR::set_wheel_picture) copied into its swapchain when a new one
     // came while the wheel is open (the present thread, as the eye images were just filled); nothing while it is closed.
     void present_wheel(VR* vr);
+    // (fix196) The mod's own menu (F11): the framework's picture of it (drawn this present, Framework::headset_menu_texture) copied into its
+    // swapchain once a headset frame, with the framework's size, distance and placing asks passed on; its swapchain let go 20 s after the
+    // menu was last drawn so (a few MB, made again at the next opening).
+    void present_fw_menu(VR* vr);
+    std::chrono::steady_clock::time_point m_fw_menu_last{};
 
     // (fix164) The soft light round the panel while nothing is behind it (OpenXR::panel_ambient), all on the graphics card, nothing read
     // back: each frame the panel's shown rows of the game's picture made small (now: 64x36, linear light), that kept smoothly over time

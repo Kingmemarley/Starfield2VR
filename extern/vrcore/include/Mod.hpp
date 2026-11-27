@@ -256,6 +256,20 @@ private:
     bool m_was_down{false};
 };
 
+// (fix196) The F11 menu's small helpers, the same in every tab.
+namespace menu_ui {
+// A grey line (wrapped) under a row: what it does, in plain words.
+inline void hint(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+// A group of rows, folded until opened (ImGui keeps it open or folded for the session).
+inline bool group(const char* title, bool open_at_first = false) {
+    return ImGui::CollapsingHeader(title, open_at_first ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None);
+}
+} // namespace menu_ui
+
 class Mod {
 public:
     virtual ~Mod() = default;
@@ -276,7 +290,18 @@ public:
     virtual void on_post_present() {}
     virtual void on_pre_imgui_frame() {}
     virtual void on_draw_ui() {}
-    virtual void on_draw_quick_ui() {} // drawn at the top of the menu, always visible
+    virtual void on_draw_quick_ui() {} // (before fix196: drawn at the top of the menu, always visible)
+    // (fix196) The F11 menu's tabs. Main: the few settings most players need, drawn in parts so every mod's rows come in one order (0
+    // recentring, 1 the view, 2 the body, 3 turning, 4 the controllers, 5 the HUD and this menu: Framework::draw_ui gives each its heading).
+    // Advanced: everything else a player may change, by feature, in parts too (0 gameplay, 1 the view and performance, 2 menus, controllers
+    // and the monitor). Debug: tests, diagnostics, troubleshooting. A mod not sorted into them
+    // shows its old rows in Debug.
+    virtual void on_draw_main_ui(int /*part*/) {}
+    virtual void on_draw_advanced_ui(int /*part*/) {}
+    virtual void on_draw_debug_ui() {
+        on_draw_quick_ui();
+        on_draw_ui();
+    }
     virtual void on_device_reset() {}
 
     // return false to block the message from reaching the game

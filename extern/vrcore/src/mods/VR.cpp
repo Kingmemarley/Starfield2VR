@@ -2,9 +2,14 @@
 // Runtime initialization, pose and input code adapted from REFramework's VR mod (MIT, praydog).
 // The frame-index driven AFR synchronisation and the Starfield-facing API are new.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <thread>
+
+#include <nlohmann/json.hpp>
 
 #include <imgui.h>
 #include <spdlog/spdlog.h>
@@ -14,6 +19,7 @@
 #include "Framework.hpp"
 #include "ModSettings.h"
 #include "mods/VR.hpp"
+#include "mods/VRConfig.hpp"
 #include "mods/vr/LaserSight.hpp"
 #include "nvidia/UpscalerAfrNvidiaModule.h"
 
@@ -298,6 +304,49 @@ std::optional<std::string> VR::initialize_openxr() {
             spdlog::info("[VR] OpenXR extensions: {} available, enabling:{}", available.size(), enabled_names);
         }
 
+        // (fix197) The OpenXR API layers the loader puts between the game and the runtime (implicit ones load by themselves: overlays,
+        // frame generation, the runtime's own helpers), for the log, once each time an instance is made; VectorXR's noted (its status file
+        // then read now and then: start_vectorxr_watch).
+        {
+            std::vector<XrApiLayerProperties> found{};
+            uint32_t count = 0;
+            if (xrEnumerateApiLayerProperties(0, &count, nullptr) == XR_SUCCESS && count > 0 && count < 256) {
+                found.resize(count, XrApiLayerProperties{XR_TYPE_API_LAYER_PROPERTIES});
+                if (xrEnumerateApiLayerProperties(count, &count, found.data()) != XR_SUCCESS) {
+                    found.clear();
+                } else {
+                    found.resize(std::min<size_t>(count, found.size()));
+                }
+            }
+            std::string names{};
+            bool vectorxr = false;
+            for (const auto& layer : found) {
+                const std::string name{layer.layerName};
+                names += std::format("{}{} (spec {}.{}.{}, version {})", names.empty() ? "" : "; ", name, XR_VERSION_MAJOR(layer.specVersion),
+                    XR_VERSION_MINOR(layer.specVersion), XR_VERSION_PATCH(layer.specVersion), layer.layerVersion);
+                std::string upper = name;
+                std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return (char)std::toupper(c); });
+                vectorxr = vectorxr || upper.find("VECTORXR") != std::string::npos;
+            }
+            static int layer_logs = 0;
+            if (layer_logs++ < 8) {
+                spdlog::info("[VR] (fix197) OpenXR API layers: {} (implicit layers load by themselves; explicit ones listed here load only when "
+                             "enabled)", found.empty() ? std::string{"none listed (no layers, or the list could not be read)"} : names);
+            }
+            m_vectorxr_layer = vectorxr;
+            // (fix200) Its Frame Generation taken as possibly running from the start (it is decided as the session is made, before its
+            // status file says anything): the Virtual Desktop fix's empty layer then never goes before the world's picture. Cleared only
+            // when a status file of a session first seen after this instance says Frame Generation is off for this game (the session
+            // named now is an earlier instance's: check_vectorxr_status).
+            m_vectorxr_instance_session = m_vectorxr_last_session.load();
+            runtimes::OpenXR::vectorxr_framegen = vectorxr;
+            if (vectorxr) {
+                spdlog::info("[VR] (fix197) VectorXR's layer is present: its status file is read every 3 s (Frame Generation's state logged as it "
+                             "changes)");
+                start_vectorxr_watch();
+            }
+        }
+
         XrInstanceCreateInfo instance_create_info{XR_TYPE_INSTANCE_CREATE_INFO};
         instance_create_info.enabledExtensionCount = (uint32_t)extensions.size();
         instance_create_info.enabledExtensionNames = extensions.data();
@@ -312,6 +361,16 @@ std::optional<std::string> VR::initialize_openxr() {
             m_openxr->error = "Could not create openxr instance: " + std::to_string((int32_t)result);
             spdlog::error("[VR] {}", m_openxr->error.value());
             return std::nullopt;
+        }
+
+        // (fix200) Its layer not in the loader's list (that list can leave out a layer, or not be readable) but its library loaded into the
+        // game by the loader all the same (the library its manifest names): taken as there, as above.
+        if (!m_vectorxr_layer.load() && GetModuleHandleW(L"XR_APILAYER_DIENERTECH_VECTORXR.dll") != nullptr) {
+            m_vectorxr_layer = true;
+            runtimes::OpenXR::vectorxr_framegen = true;
+            spdlog::info("[VR] (fix200) VectorXR's layer is loaded (its library is in the game, though not in the loader's list): its status file is "
+                         "read every 3 s, and its Frame Generation taken as possibly running");
+            start_vectorxr_watch();
         }
     }
 
@@ -521,6 +580,7 @@ std::optional<std::string> VR::reinitialize_openxr() {
     m_d3d12.openxr().destroy_conversation();
     m_d3d12.openxr().destroy_wheel(); // (fix171)
     m_d3d12.openxr().destroy_console(); // (fix177)
+    m_d3d12.openxr().destroy_fw_menu(); // (fix196)
     m_d3d12.openxr().destroy_swapchains();
 
     m_openxr.reset();
@@ -598,10 +658,14 @@ void VR::on_wait_rendering(uint32_t frame_index) {
     // Toggle requests (from the controller or a key, on other threads) are applied here, on the game thread.
     // Each one moves to the next of stereo, mono and AER (fix136; mono and AER need OpenXR).
     if (const int toggles = m_mono_toggles.exchange(0); toggles > 0) {
-        for (int i = 0; i < toggles % 3; ++i) {
+        // (fix196) AER only with "Include AER in the eye-mode button" on (off by default): then stereo, mono, AER in turn as before; else
+        // stereo and mono. AER chosen in the menu (or saved from before) goes to stereo at the next press either way, as it did. One step a
+        // press (a few at most in one frame).
+        const bool with_aer = m_aer_in_button->value();
+        for (int i = 0; i < std::min(toggles, 6); ++i) {
             if (m_mono->value()) {
                 m_mono->value() = false;
-                m_aer->value()  = true;
+                m_aer->value()  = with_aer;
             } else if (m_aer->value()) {
                 m_aer->value() = false;
             } else {
@@ -629,6 +693,10 @@ void VR::on_wait_rendering(uint32_t frame_index) {
     }
     // (fix173) A refused switch's two short strong pulses in both hands: what the click's buzz still plays stopped first, then a pulse, and
     // another 0.2 s on (the click's own buzz, ModConfig's, is one long or short pulse: this is told apart by its two).
+    if (m_refused_buzz_asked.exchange(false)) { // (fix198, the review: a menu's refusal, from its own thread)
+        m_refused_buzz_step = 1;
+        m_refused_buzz_at   = std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+    }
     if (m_refused_buzz_step > 0 && std::chrono::steady_clock::now() >= m_refused_buzz_at) {
         if (const auto xr = m_openxr; xr != nullptr && get_runtime()->is_openxr() && is_using_controllers()) { // (a copy: it may be made anew on another thread)
             for (const auto hand : {VRRuntime::Hand::LEFT, VRRuntime::Hand::RIGHT}) {
@@ -864,6 +932,22 @@ void VR::on_begin_rendering(uint32_t frame_index) {
         runtime->consume_events(nullptr);
     }
 
+    // (fix198, the review) A menu's sharpness: applied once it has not changed for 750 ms (each step of the VR tab's stepper would remake
+    // the headset's images otherwise) and no game menu is shown (in the game's Settings it is applied as the menu closes; at the main menu,
+    // once a save is loaded and play shows).
+    if (const float asked = m_res_asked_value.load(); asked > 0.0f && runtime->is_openxr()) {
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ms - m_res_asked_ms.load() >= 750 && !ModSettings::g_internalSettings.showQuadDisplay) {
+            float expected = asked;
+            if (m_res_asked_value.compare_exchange_strong(expected, -1.0f)) { // (taken: a newer value waits its own 750 ms)
+                if (const auto xr = m_openxr; xr != nullptr && xr->resolution_scale != m_resolution_scale->value()) {
+                    m_wants_swapchain_rebuild = true;
+                }
+            }
+        }
+    }
+
     if (m_wants_swapchain_rebuild && runtime->is_openxr()) {
         // A new resolution scale. Only the size the game is asked to render at changes here: the game window is resized to
         // it (CreationEngineRendererModule::SetWindowSize), and the headset images follow the game's backbuffer on the
@@ -936,8 +1020,9 @@ void VR::update_hmd_state(uint32_t frame_index) {
         set_rotation_offset(glm::identity<glm::quat>());
         m_standing_origin = get_position_unsafe(0);
         runtime->wants_reset_origin = false;
-        // (The headset's own recenter: an open menu's panel is put in front of you again.)
+        // (The headset's own recenter: an open menu's panel is put in front of you again; fix196: the mod's own menu's too.)
         m_openxr->panel_recenter = true;
+        m_openxr->fw_menu_recenter = true;
     }
 
     runtime->update_matrices(m_nearz, m_farz);
@@ -1735,8 +1820,9 @@ Vector4f VR::get_standing_origin() const {
 void VR::set_standing_origin(const Vector4f& origin) {
     std::unique_lock _{get_runtime()->pose_mtx};
     m_standing_origin = origin;
-    // (A recenter: an open menu's panel is put in front of you again.)
+    // (A recenter: an open menu's panel is put in front of you again; fix196: the mod's own menu's too.)
     m_openxr->panel_recenter = true;
+    m_openxr->fw_menu_recenter = true;
     static int logged = 0;
     if (logged++ < 20) {
         spdlog::info("[VR] standing origin set (a recenter): {:.2f} {:.2f} {:.2f}", origin.x, origin.y, origin.z);
@@ -1770,151 +1856,376 @@ void VR::recenter_view() {
 // UI / config
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-void VR::on_draw_ui() {
-    if (!ImGui::CollapsingHeader(get_name().data())) {
+// (fix196) The eye mode as one choice (the three saved settings behind it unchanged: MonoMode, AlternateEyeRendering, FullStereo).
+int VR::eye_mode_choice() const {
+    if (m_mono->value()) {
+        return 2;
+    }
+    if (m_aer->value()) {
+        return 3;
+    }
+    return m_full_stereo->value() ? 0 : 1;
+}
+
+void VR::set_eye_mode_choice(int choice) {
+    switch (choice) {
+    case 0:
+        m_mono->value() = false;
+        m_aer->value() = false;
+        m_full_stereo->value() = true;
+        break;
+    case 1:
+        m_mono->value() = false;
+        m_aer->value() = false;
+        m_full_stereo->value() = false;
+        break;
+    case 2:
+        m_mono->value() = true;
+        m_aer->value() = false;
+        break;
+    default:
+        m_mono->value() = false;
+        m_aer->value() = true;
+        break;
+    }
+    spdlog::info("[VR] (fix196) eye mode chosen in the menu: {} (from the next frame pair)",
+        choice == 0 ? "full stereo" : choice == 1 ? "stereo, the eyes taking turns" : choice == 2 ? "mono" : "AER");
+}
+
+// (fix198) The eye mode chosen in a menu, refused as the eye-mode button refuses it (fix165): while video memory has been over its budget
+// 3 s, since a second picture and DLSS instance would push more of the game's data out of it. Two short buzzes as the button's refusal
+// gives (felt in the game's menu, where no line shows). (fix198, the review) Only a switch to a heavier mode than the one chosen now is
+// refused (full stereo, then the eyes taking turns or AER, then mono): a lighter one can only help.
+namespace {
+int eye_mode_weight(int choice) {
+    return choice == 0 ? 2 : (choice == 2 ? 0 : 1);
+}
+const char* eye_mode_name(int choice) {
+    return choice == 0 ? "full stereo" : choice == 1 ? "stereo, the eyes taking turns" : choice == 2 ? "mono" : "AER";
+}
+} // namespace
+
+bool VR::eye_mode_refused(int choice, const char* where) {
+    choice = std::clamp(choice, 0, 3);
+    const auto runtime = get_runtime();
+    if (eye_mode_weight(choice) <= eye_mode_weight(eye_mode_choice()) || runtime == nullptr || !runtime->is_openxr() ||
+        !m_d3d12.memory_over_for(3000)) {
+        return false;
+    }
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t since = m_d3d12.m_mem_over_since_ms.load();
+    std::string why = std::format("Not switched to {}: video memory had been over its budget for {} s ({} of {} MB). Try again once it "
+                                  "has been under it for 2 s.",
+        eye_mode_name(choice), since != 0 ? (now_ms - since) / 1000 : 0, m_d3d12.m_mem_used_mb.load(), m_d3d12.m_mem_budget_mb.load());
+    static std::atomic<int> s_logged{0};
+    if (s_logged.fetch_add(1) < 50) {
+        spdlog::info("[VR] (fix198) the eye mode chosen in {} ({}) refused: {}", where, eye_mode_name(choice), why);
+    }
+    {
+        std::scoped_lock _{m_eye_mode_refused_mtx};
+        m_eye_mode_refused_until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        m_eye_mode_refused_why = std::move(why);
+    }
+    m_refused_buzz_asked = true; // (its two pulses started on the game thread: on_wait_rendering)
+    return true;
+}
+
+void VR::choose_eye_mode(int choice) {
+    set_eye_mode_choice(std::clamp(choice, 0, 3));
+    {
+        std::scoped_lock _{m_eye_mode_refused_mtx};
+        m_eye_mode_refused_until = {};
+    }
+    if (g_framework != nullptr) {
+        g_framework->request_save_config();
+    }
+}
+
+bool VR::try_eye_mode_choice(int choice, const char* where) {
+    if (eye_mode_refused(choice, where)) {
+        return false;
+    }
+    choose_eye_mode(choice);
+    return true;
+}
+
+bool VR::eye_mode_refused_lately() const {
+    std::scoped_lock _{m_eye_mode_refused_mtx};
+    return std::chrono::steady_clock::now() < m_eye_mode_refused_until;
+}
+
+std::string VR::eye_mode_refusal() const {
+    std::scoped_lock _{m_eye_mode_refused_mtx};
+    return std::chrono::steady_clock::now() < m_eye_mode_refused_until ? m_eye_mode_refused_why : std::string{};
+}
+
+// (fix198, the review) Only noted here (any thread: a menu's handler may run on its own): on_begin_rendering applies it on the game thread
+// once it has stayed 750 ms and no game menu is shown. The time is kept only when the value asked for changes (a menu may ask again).
+void VR::apply_resolution_scale() {
+    const float value = m_resolution_scale->value();
+    if (!std::isfinite(value) || value <= 0.0f) {
         return;
     }
+    if (m_res_asked_value.load() != value) {
+        m_res_asked_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    m_res_asked_value = value; // (after its time: on_begin_rendering reads the value, then the time)
+}
 
-    auto display_error = [](auto& runtime, const char* dll_name) {
-        if (runtime == nullptr || (!runtime->error && runtime->loaded)) {
+// (fix196) The Main tab: the eye mode and the sharpness (part 1), left-handed (part 4).
+void VR::on_draw_main_ui(int part) {
+    // (fix198) With the game's Settings > VR tab working, the eye mode, the sharpness and left-handed are there (the same settings); here
+    // only what concerns this menu: the runtime's absence, the VectorXR note. (fix198, the review) Drawn here too in the Advanced tab's
+    // "Main VR settings" group, when asked for (VRConfig::s_main_rows_here: the VectorXR note is then left to Main).
+    const bool in_game_tab = VRConfig::main_rows_in_game_tab();
+    const bool on_main     = !VRConfig::s_main_rows_here.load();
+    if (part == 1) {
+        if (get_runtime() == nullptr || !get_runtime()->loaded) {
+            // (fix196, the review) Why, in one line.
+            std::string why{"start the headset's software, such as Virtual Desktop, before the game"};
+            if (m_openxr != nullptr && m_openxr->error) {
+                why = m_openxr->dll_missing ? std::string{"openxr_loader.dll was not found next to the mod"} : "OpenXR: " + *m_openxr->error;
+            } else if (m_openvr != nullptr && m_openvr->error) {
+                why = m_openvr->dll_missing ? std::string{"openvr_api.dll was not found"} : "OpenVR: " + *m_openvr->error;
+            }
+            ImGui::TextWrapped("No VR runtime loaded (%s).", why.c_str());
             return;
         }
-
-        if (runtime->error && runtime->dll_missing) {
-            ImGui::TextWrapped("%s not loaded: %s not found", runtime->name().data(), dll_name);
-        } else if (runtime->error) {
-            ImGui::TextWrapped("%s not loaded: %s", runtime->name().data(), runtime->error->c_str());
+        if (!in_game_tab) {
+            static const char* const kEyeModes[] = {
+                "Full stereo",
+                "Stereo, eyes take turns",
+                "Mono",
+                "AER (one eye a frame)",
+            };
+            int choice = eye_mode_choice();
+            if (ImGui::Combo("Eye mode", &choice, kEyeModes, IM_ARRAYSIZE(kEyeModes))) {
+                try_eye_mode_choice(choice, "the F11 menu"); // (fix198: refused as the eye-mode button refuses it)
+            }
         }
-    };
-
-    display_error(m_openxr, "openxr_loader.dll");
-    display_error(m_openvr, "openvr_api.dll");
-
-    m_requested_runtime->draw("Preferred Runtime (restart to apply)");
-
-    if (!get_runtime()->loaded) {
-        ImGui::TextWrapped("No VR runtime loaded.");
-        return;
-    }
-
-    ImGui::Separator();
-    ImGui::TextWrapped("VR Runtime: %s", get_runtime()->name().data());
-    ImGui::TextWrapped("Render Resolution: %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
-    ImGui::TextWrapped("Frames: engine %u, render %u, present %u", m_engine_frame_count.load(), m_render_frame_count.load(), m_presenter_frame_count.load());
-
-    if (get_runtime()->is_openxr()) {
-        m_resolution_scale->draw("OpenXR Resolution Scale");
-        // Applied once the slider is let go (or a typed value is entered; or, if the menu was closed mid-drag, when it is next
-        // shown), not at every step of a drag.
-        if (!ImGui::IsItemActive() && m_openxr->resolution_scale != m_resolution_scale->value()) {
-            m_wants_swapchain_rebuild = true;
+        if (const std::string refusal = eye_mode_refusal(); !refusal.empty()) { // (fix198, the review: a copy, made under its lock)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s", refusal.c_str());
+            ImGui::PopStyleColor();
+        }
+        // (fix196, the review) What runs now, when it is not what was chosen.
+        {
+            const int chosen = eye_mode_choice();
+            std::string now{};
+            if (chosen == 0 && !is_native()) {
+                const char* running = is_mono() ? "mono" : is_aer() ? "AER" : "the eyes take turns";
+                const char* why = !get_runtime()->is_openxr() ? "full stereo needs OpenXR"
+                                  : is_mono()                 ? "a game menu is shown, or video memory is full"
+                                                              : "full stereo can't run here right now: a game menu, the hand scanner, build "
+                                                                "mode or a loading screen";
+                now = std::format("Now: {} ({}).", running, why);
+            } else if ((chosen == 1 || chosen == 3) && is_mono()) {
+                now = "Now: mono (a game menu is shown, or video memory is full).";
+            }
+            if (!now.empty() && !in_game_tab) {
+                menu_ui::hint(now.c_str());
+            }
+        }
+        if (!in_game_tab) {
+            menu_ui::hint("Full stereo: real depth; the heaviest (the world drawn twice a frame). Eyes take turns: depth, fewer fps lost, each eye "
+                          "a new picture every other frame. Mono: no depth, the most fps. AER: one eye drawn a frame, light and smooth. The left "
+                          "grip held + a right stick click switches too. Mono and AER need OpenXR.");
+        }
+        // (fix197) VectorXR's Frame Generation: a note when it makes frames while the eyes are in AER (it cannot work with it), and its state.
+        if (on_main && m_vectorxr_layer.load()) {
+            if (vectorxr_aer_conflict()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
+                ImGui::TextWrapped("VectorXR's Frame Generation can't work with AER (alternate-eye rendering): use mono or full stereo.");
+                ImGui::PopStyleColor();
+            } else {
+                std::string summary{};
+                {
+                    std::scoped_lock _{m_vectorxr_mtx};
+                    summary = m_vectorxr_summary;
+                }
+                menu_ui::hint(("VectorXR: " + (summary.empty() ? std::string{"its layer is loaded (no status read yet)"} : summary)).c_str());
+            }
         }
 
-        if (ImGui::TreeNode("Bindings")) {
-            m_openxr->display_bindings_editor();
-            ImGui::TreePop();
+        if (in_game_tab) {
+            return;
         }
+        if (get_runtime()->is_openxr()) {
+            // (A slider of its own over the same setting, 0.5 to 1.5: the full range is in the Debug tab.)
+            float scale = m_resolution_scale->value();
+            ImGui::PushID("main_resolution");
+            if (ImGui::SliderFloat("Sharpness (resolution)", &scale, 0.5f, 1.5f, "%.2f")) {
+                m_resolution_scale->value() = std::clamp(scale, 0.5f, 1.5f);
+                g_framework->request_save_config();
+            }
+            // Asked for once the slider is let go after a change (or a typed value is entered), not at each step of a drag; (fix198, the
+            // review) applied 750 ms on, once no game menu is shown.
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                apply_resolution_scale();
+            }
+            ImGui::PopID();
+            const std::string sharpness = std::format("1.0 by default: the headset's own size. Higher: sharper, but fewer fps and more video "
+                                                      "memory. Lower: more fps, but blurrier (0.8 is about 64% of the pixels: 1.0 has about "
+                                                      "1.56 times those of 0.8). Applied a moment after you let go (with a game menu shown, "
+                                                      "as it closes). Each eye is drawn at {} x {} now.",
+                get_runtime()->get_width(), get_runtime()->get_height());
+            menu_ui::hint(sharpness.c_str());
+        } else {
+            menu_ui::hint("The resolution is set in SteamVR with this runtime.");
+        }
+    } else if (part == 4 && !in_game_tab) {
+        m_swap_controllers->draw("Left-handed");
+        menu_ui::hint("The controllers swap jobs: the left one fires, aims and turns, the right one walks (the face buttons keep their letters).");
+    }
+}
 
-        const double min_ = 0.0;
-        const double max_ = 5.0;
-        ImGui::SliderScalar("Prediction Scale", ImGuiDataType_Double, &m_openxr->prediction_scale, &min_, &max_);
-    } else {
-        ImGui::TextWrapped("Resolution can be changed in SteamVR");
+// (fix196) The Advanced tab: the rest of the headset's settings a player may change (part 1 the eye modes, part 2 the controllers and the
+// monitor).
+void VR::on_draw_advanced_ui(int part) {
+    if (part == 1 && menu_ui::group("Eye modes and recentring")) {
+        m_mono_in_menus->draw("Mono while a game menu is shown");
+        menu_ui::hint("Menus run faster in mono and use less video memory; your eye mode comes back as the menu closes (with full stereo, "
+                      "once the menu's pictures are let go: up to 3 s).");
+        if (m_aer_in_button->draw("Include AER in the eye-mode button")) {
+            g_framework->request_save_config();
+        }
+        menu_ui::hint("Off: the left grip held + a right stick click switches between stereo and mono only. On: stereo, mono and AER in turn.");
+        m_mono_key->draw("Eye-mode key (keyboard)");
+        m_recenter_view_key->draw("Recenter key (keyboard)");
+        m_set_standing_key->draw("Set standing origin key (keyboard)");
+        if (ImGui::Button("Set standing height")) {
+            auto origin = get_standing_origin();
+            origin.y = get_position(0).y;
+            set_standing_origin(origin);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Set standing origin")) {
+            set_standing_origin(get_position(0));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Recenter view")) {
+            recenter_view();
+        }
+        menu_ui::hint("\"Recenter now\" (in the game's Settings > VR; on this menu's Main tab when that tab is not there) recentres as most "
+                      "players need; these set the headset's own origin parts.");
+    }
+    if (part == 2 && menu_ui::group("Controllers (headset side)")) {
+        m_motion_controls_inactivity_timer->draw("Motion controls idle time (s)");
+        menu_ui::hint("How long after the controllers were last used they still count as in use (after that a gamepad or the keyboard and mouse work as on a flat screen).");
+        m_joystick_deadzone->draw("Thumbstick dead zone");
+        menu_ui::hint("How far a thumbstick must move before it counts (raise it if a stick drifts).");
+    }
+    if (part == 2 && menu_ui::group("Monitor")) {
+        m_desktop_fix->draw("Desktop recording fix");
+        menu_ui::hint("The monitor shows every frame evenly, for recording (costs a full-size copy every two frames).");
+    }
+}
+
+// (fix196) The Debug tab: the runtime, the stereo tests and the raw eye switches.
+void VR::on_draw_debug_ui() {
+    if (menu_ui::group("Headset and runtime")) {
+        auto display_error = [](auto& runtime, const char* dll_name) {
+            if (runtime == nullptr || (!runtime->error && runtime->loaded)) {
+                return;
+            }
+
+            if (runtime->error && runtime->dll_missing) {
+                ImGui::TextWrapped("%s not loaded: %s not found", runtime->name().data(), dll_name);
+            } else if (runtime->error) {
+                ImGui::TextWrapped("%s not loaded: %s", runtime->name().data(), runtime->error->c_str());
+            }
+        };
+
+        display_error(m_openxr, "openxr_loader.dll");
+        display_error(m_openvr, "openvr_api.dll");
+
+        m_requested_runtime->draw("Preferred Runtime (restart to apply)");
+
+        if (!get_runtime()->loaded) {
+            ImGui::TextWrapped("No VR runtime loaded.");
+        } else {
+            ImGui::TextWrapped("VR Runtime: %s", get_runtime()->name().data());
+            ImGui::TextWrapped("Render Resolution: %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
+            ImGui::TextWrapped("Frames: engine %u, render %u, present %u", m_engine_frame_count.load(), m_render_frame_count.load(),
+                m_presenter_frame_count.load());
+
+            if (get_runtime()->is_openxr()) {
+                m_resolution_scale->draw("OpenXR Resolution Scale (full range)");
+                // Applied once the slider is let go (or a typed value is entered; or, if the menu was closed mid-drag, when it is next
+                // shown), not at every step of a drag.
+                if (!ImGui::IsItemActive() && m_openxr->resolution_scale != m_resolution_scale->value()) {
+                    m_wants_swapchain_rebuild = true;
+                }
+
+                if (ImGui::TreeNode("Bindings")) {
+                    m_openxr->display_bindings_editor();
+                    ImGui::TreePop();
+                }
+
+                const double min_ = 0.0;
+                const double max_ = 5.0;
+                ImGui::SliderScalar("Prediction Scale", ImGuiDataType_Double, &m_openxr->prediction_scale, &min_, &max_);
+            } else {
+                ImGui::TextWrapped("Resolution can be changed in SteamVR");
+            }
+
+            // (fix189) Not offered with OpenXR: remaking it (reinitialize_openxr) frees the runtime while the present thread may still be
+            // using it (on_present holds the pointer get_runtime() gave it), a crash. Restarting the game is the safe way.
+            if (get_runtime()->is_openxr()) {
+                ImGui::TextDisabled("Reinitialize Runtime: not available with OpenXR (restart the game instead)");
+            } else if (ImGui::Button("Reinitialize Runtime")) {
+                get_runtime()->wants_reinitialize = true;
+            }
+        }
     }
 
-    ImGui::Separator();
-
-    if (ImGui::Button("Set Standing Height")) {
-        auto origin = get_standing_origin();
-        origin.y = get_position(0).y;
-        set_standing_origin(origin);
-    }
-
-    ImGui::SameLine();
-
-    if (ImGui::Button("Set Standing Origin")) {
-        set_standing_origin(get_position(0));
-    }
-
-    ImGui::SameLine();
-
-    if (ImGui::Button("Recenter View")) {
-        recenter_view();
-    }
-
-    // (fix189) Not offered with OpenXR: remaking it (reinitialize_openxr) frees the runtime while the present thread may still be using
-    // it (on_present holds the pointer get_runtime() gave it), a crash. Restarting the game is the safe way.
-    if (get_runtime()->is_openxr()) {
-        ImGui::TextDisabled("Reinitialize Runtime: not available with OpenXR (restart the game instead)");
-    } else if (ImGui::Button("Reinitialize Runtime")) {
-        get_runtime()->wants_reinitialize = true;
-    }
-
-    m_set_standing_key->draw("Set Standing Origin Key");
-    m_recenter_view_key->draw("Recenter View Key");
-
-    ImGui::Separator();
-
-    if (ImGui::TreeNodeEx("Stereo (diagnostics)", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextWrapped("If near objects (your body, gun, crosshair) look doubled or impossible to focus, "
-                           "try these live and see what changes.");
+    if (menu_ui::group("Stereo (diagnostics)")) {
+        ImGui::TextWrapped("If near objects (your body, gun, crosshair) look doubled or impossible to focus, try these live and see what "
+                           "changes (close this menu to look).");
         m_swap_eyes->draw("Swap Eyes");
         ImGui::SameLine();
         ImGui::TextDisabled("(if this fixes it, the eyes were reversed)");
+        if (m_symmetric_projection->draw("Symmetric eye projection (each eye drawn centred; off: the part no eye sees trimmed, sharper, but "
+                                         "blocky lighting glitches)")) {
+            spdlog::info("[QuickTest] Symmetric eye projection -> {}", m_symmetric_projection->value() ? "on" : "off");
+        }
+        menu_ui::hint("The eye mode's three switches as they are saved (\"Eye mode\", in the game's Settings > VR, sets them together):");
         if (m_mono->draw("Mono (one picture for both eyes, a new one every frame; no stereo depth)")) {
             spdlog::info("[VR] mono {} (from the next frame pair)", m_mono->value() ? "on" : "off");
         }
-        m_mono_key->draw("Mono / AER Toggle Key (stereo, mono, AER in turn)");
-        m_mono_in_menus->draw("Mono while a menu is shown (back to stereo when it closes)");
         if (m_aer->draw("AER (one eye drawn each frame, each sent with the other eye's last picture: a new headset frame every frame)")) {
             spdlog::info("[VR] AER {} (from the next frame pair; mono first if both)", m_aer->value() ? "on" : "off");
+        }
+        if (m_full_stereo->draw("Full stereo (in stereo: both eyes drawn in every frame, as two views of the world)")) {
+            spdlog::info("[VR] full stereo {} (from the next frame pair, in stereo)", m_full_stereo->value() ? "on" : "off");
         }
         if (m_pipelined_pacing->draw("Pipelined pacing (the game does not wait for the headset before each frame pair)")) {
             m_pipelined_failed = false;
             spdlog::info("[VR] pipelined pacing {}", m_pipelined_pacing->value() ? "on" : "off");
         }
-        if (m_full_stereo->draw("Full stereo (in stereo: both eyes drawn in every frame, as two views of the world)")) {
-            spdlog::info("[VR] full stereo {} (from the next frame pair, in stereo)", m_full_stereo->value() ? "on" : "off");
-        }
-        ImGui::TextDisabled("Also: hold the left grip, then click the right stick (stereo, mono, AER in turn). OpenXR only.");
         m_eye_separation_scale->draw("Eye Separation Scale");
         ImGui::TextDisabled("0 = no stereo depth. If things still look doubled at 0, it is a\n"
                             "temporal effect (DLSS / FSR / TAA history), not the eye offset.");
-
 
         if (ImGui::Button("Log Eye Timing (40 frames)")) {
             spdlog::info("[VR-TRACE] start (swap eyes {}, separation {:.2f})", m_swap_eyes->value(), m_eye_separation_scale->value());
             m_trace_remaining = 40;
         }
 
-        ImGui::TreePop();
-    }
-
-    ImGui::Separator();
-    m_swap_controllers->draw("Swap Controller Inputs (left-handed)");
-    m_motion_controls_inactivity_timer->draw("Motion Controls Inactivity Timer");
-    m_joystick_deadzone->draw("Joystick Deadzone");
-    m_desktop_fix->draw("Desktop Recording Fix");
-}
-
-void VR::on_draw_quick_ui() {
-    if (m_symmetric_projection->draw("Symmetric eye projection (each eye drawn centred; off: the part no eye sees trimmed, sharper, but blocky lighting glitches)")) {
-        spdlog::info("[QuickTest] Symmetric eye projection -> {}", m_symmetric_projection->value() ? "on" : "off");
-    }
-
-    if (ImGui::Button("Save Stereo Screenshot")) {
-        ++m_screenshot_number;
-        m_screenshot_armed = true;
-        m_screenshot_done[0] = m_screenshot_done[1] = false;
-        m_screenshot_not_before = {};
-    }
-    ImGui::SameLine();
-    if (m_screenshot_armed) {
-        ImGui::TextWrapped("#%d: close this menu and hold still, it saves 2 s later", m_screenshot_number);
-    } else if (m_screenshot_number > 0) {
-        ImGui::TextWrapped("Saved sfvr\\stereo_%d_left.jpg / _right.jpg", m_screenshot_number);
-    } else {
-        ImGui::TextWrapped("Saves both eye images to the sfvr folder (numbered, nothing is overwritten)");
+        if (ImGui::Button("Save Stereo Screenshot")) {
+            ++m_screenshot_number;
+            m_screenshot_armed = true;
+            m_screenshot_done[0] = m_screenshot_done[1] = false;
+            m_screenshot_not_before = {};
+        }
+        ImGui::SameLine();
+        if (m_screenshot_armed) {
+            ImGui::TextWrapped("#%d: close this menu and hold still, it saves 2 s later", m_screenshot_number);
+        } else if (m_screenshot_number > 0) {
+            ImGui::TextWrapped("Saved sfvr\\stereo_%d_left.jpg / _right.jpg", m_screenshot_number);
+        } else {
+            ImGui::TextWrapped("Saves both eye images to the sfvr folder (numbered, nothing is overwritten)");
+        }
     }
 }
 
@@ -1925,6 +2236,19 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
 
     if (m_motion_controls_inactivity_timer->value() <= 10.0f) {
         m_motion_controls_inactivity_timer->value() = 30.0f;
+    }
+
+    // (fix198) The resolution's new default, 1.0: a config that still holds the old default 0.8 starts at 1.0, once (the mark saved with
+    // it); a value chosen later, 0.8 too, stays as chosen.
+    if (!m_resolution_default_1->value()) {
+        if (std::abs(m_resolution_scale->value() - 0.8f) < 0.001f) {
+            m_resolution_scale->value() = 1.0f;
+            spdlog::info("[VR] (fix198) resolution scale: the old default 0.8 moved to the new default 1.0 (once; choose 0.8 again in the menu to keep it)");
+        }
+        m_resolution_default_1->value() = true;
+        if (g_framework != nullptr) {
+            g_framework->request_save_config();
+        }
     }
 
     // Runtime already up (config reloaded): apply resolution scale on the next frame.
@@ -1938,4 +2262,183 @@ void VR::on_config_save(utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_save(cfg);
     }
+}
+
+// (fix197) VectorXR's status file, read every 3 s on a thread of its own (never the game's or the present thread), once its layer is seen.
+// (Each poll on its own: nothing it meets ends the thread or reaches the game; the review.)
+void VR::start_vectorxr_watch() {
+    if (m_vectorxr_watching.exchange(true)) {
+        return;
+    }
+    try {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                try {
+                    const auto vr = VR::get(); // (a copy for this poll)
+                    if (vr == nullptr) {
+                        return;
+                    }
+                    vr->check_vectorxr_status();
+                } catch (...) {
+                    // (Left for the next poll.)
+                }
+            }
+        }).detach();
+    } catch (...) {
+        m_vectorxr_watching = false;
+        spdlog::warn("[VR] (fix197) VectorXR: the thread that reads its status file could not be started; its state is not followed");
+    }
+}
+
+// (fix197) VectorXR's published status (its documented status file, %LOCALAPPDATA%\VectorXR\api\status.json: written about once a second by
+// the layer in the game with a live session, replaced in one step; read whole with read, write and delete sharing so its next write is
+// never held up). Only our process's, and only while current (written within the last 3 s). Read only. A file that cannot be read this
+// poll (being replaced, half-written, an unexpected shape) changes nothing: what was known stays until a poll reads it.
+void VR::check_vectorxr_status() {
+    std::string summary{"no status file (Frame Generation off, or not started yet)"};
+    std::string fps{}; // (shown in the menu, not compared: it moves all the time)
+    bool generating = false;
+    int multiplier = 0;
+    // (fix200) What this poll says of Frame Generation for the session: -1 nothing (no file, another program's, stale: as it was), 0 off
+    // for this game (its part of the file absent: it cannot start before the game restarts), 1 on in any state (off by its own key,
+    // waiting, standing by, paused, generating: it may make frames).
+    int framegen_known = -1;
+    static int missing_polls = 0; // (this thread only)
+    static bool open_error_told = false;
+    wchar_t local[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) {
+        const std::wstring path = std::wstring{local} + L"\\VectorXR\\api\\status.json";
+        const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+                // (Being replaced or removed this moment, or held: as it was, tried again at the next poll.)
+                if (!open_error_told) {
+                    open_error_told = true;
+                    spdlog::info("[VR] (fix197) VectorXR: its status file could not be opened this time (error {}); tried again every 3 s", error);
+                }
+                return;
+            }
+            // (Not there: only after two polls in a row counted as no file; a moment's absence as it is replaced is not.)
+            if (++missing_polls < 2) {
+                return;
+            }
+        } else {
+            missing_polls = 0;
+            std::string text{};
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < 256 * 1024) {
+                text.resize((size_t)size.QuadPart);
+                DWORD read = 0;
+                if (!ReadFile(file, text.data(), (DWORD)text.size(), &read, nullptr)) {
+                    read = 0;
+                }
+                text.resize(read);
+            }
+            CloseHandle(file);
+            // (Its fields read loosely: a value of another type than expected counts as missing; "generating" may be a number.)
+            const auto text_of = [](const nlohmann::json& j, const char* key, const char* otherwise) {
+                const auto it = j.find(key);
+                return it != j.end() && it->is_string() ? it->get<std::string>() : std::string{otherwise};
+            };
+            const auto number_of = [](const nlohmann::json& j, const char* key, double otherwise) {
+                const auto it = j.find(key);
+                return it != j.end() && it->is_number() ? it->get<double>() : otherwise;
+            };
+            // (fix200) A session's identity (its sessionId hashed; 0 none: an empty or missing one).
+            const auto session_hash = [](const std::string& id) -> uint64_t {
+                if (id.empty()) {
+                    return 0;
+                }
+                const uint64_t h = (uint64_t)std::hash<std::string>{}(id);
+                return h != 0 ? h : 1;
+            };
+            const auto flag_of = [](const nlohmann::json& j, const char* key) {
+                const auto it = j.find(key);
+                return it != j.end() && ((it->is_boolean() && it->get<bool>()) || (it->is_number() && it->get<double>() != 0.0));
+            };
+            bool readable = false;
+            try {
+                const auto doc = nlohmann::json::parse(text, nullptr, false);
+                if (!doc.is_discarded() && doc.is_object() && text_of(doc, "schema", "") == "vectorxr.status") {
+                    readable = true;
+                    const auto pid = (int64_t)number_of(doc, "processId", 0.0);
+                    const auto updated = (int64_t)number_of(doc, "updatedAtUnixMilliseconds", 0.0);
+                    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    const auto fg_it = doc.find("framegen");
+                    if (pid != (int64_t)GetCurrentProcessId()) {
+                        summary = "its status file is another program's";
+                    } else if (updated <= 0 || now_ms - updated >= 3000) {
+                        summary = "its status file is stale";
+                    } else if (fg_it == doc.end() || !fg_it->is_object()) {
+                        summary = "Frame Generation off for this game";
+                        // (fix200) Taken as off only from a session first seen after the latest instance was made (one named, not the
+                        // session named when it was made: a file left from before it says nothing of the new session), and only when the
+                        // part is absent (another shape: not taken as off).
+                        const uint64_t session = session_hash(text_of(doc, "sessionId", ""));
+                        m_vectorxr_last_session = session;
+                        framegen_known = fg_it == doc.end() && session != 0 && session != m_vectorxr_instance_session.load() ? 0 : -1;
+                    } else {
+                        m_vectorxr_last_session = session_hash(text_of(doc, "sessionId", "")); // (fix200)
+                        framegen_known = 1;
+                        const auto& fg = *fg_it;
+                        const std::string state = text_of(fg, "state", "unknown");
+                        generating = flag_of(fg, "generating");
+                        multiplier = generating ? (int)number_of(fg, "multiplier", 0.0) : 0;
+                        summary = std::format("Frame Generation {} ({}{}, {} {})", state, generating ? "generating " : "not generating",
+                            generating ? std::format("x{}", multiplier) : std::string{}, text_of(fg, "mode", "?"), text_of(fg, "frameRate", "?"));
+                        fps = std::format(", {:.0f} game fps -> {:.0f} headset fps", number_of(fg, "appFps", 0.0), number_of(fg, "outputFps", 0.0));
+                    }
+                }
+            } catch (...) {
+                readable = false;
+            }
+            if (!readable) {
+                return; // (half-written or another shape: as it was, tried again at the next poll)
+            }
+        }
+    }
+
+    // (fix200) For the Virtual Desktop fix (OpenXR::vectorxr_framegen): off only when our current status file says Frame Generation is
+    // off for this game; on again as soon as one says it is on (a new session made with it).
+    if (framegen_known >= 0) {
+        const bool now_on = framegen_known == 1;
+        if (runtimes::OpenXR::vectorxr_framegen.exchange(now_on) != now_on) {
+            static int flips = 0; // (this thread only)
+            if (flips++ < 10) {
+                spdlog::info("[VR] (fix200) VectorXR's Frame Generation {}: the Virtual Desktop fix's empty layer {}", now_on ? "is on for this session"
+                    : "is off for this game (its status file says so)", now_on ? "is never put before the world's picture"
+                    : "goes first behind menus again where needed");
+            }
+        }
+    }
+
+    const bool changed_state = generating != m_vectorxr_generating.load() || multiplier != m_vectorxr_multiplier.load();
+    m_vectorxr_generating = generating;
+    m_vectorxr_multiplier = multiplier;
+    static std::string previous{}; // (this thread only)
+    {
+        std::scoped_lock _{m_vectorxr_mtx};
+        m_vectorxr_summary = summary + fps;
+    }
+    // (Logged as it changes: whether it generates, its multiplier, or what the file says; the fps alone changing is not logged.)
+    static int logs = 0;
+    if ((changed_state || previous != summary) && logs < 60) {
+        ++logs;
+        spdlog::info("[VR] (fix197) VectorXR: {}{}", summary, fps);
+    }
+    previous = summary;
+    // AER with Frame Generation making frames: warned each time it starts, at most 10 times (Frame Generation takes the first projection
+    // layer's views as one moment; AER's carry two).
+    const bool conflict = generating && is_aer();
+    static int conflict_logs = 0;
+    if (conflict && !m_vectorxr_conflict_told && conflict_logs < 10) {
+        ++conflict_logs;
+        spdlog::warn("[VR] (fix197) VectorXR's Frame Generation is making frames while the eyes are in AER (one eye new each frame, the other's "
+                     "older picture with it): it can't work with that; use mono or full stereo");
+    }
+    m_vectorxr_conflict_told = conflict;
 }

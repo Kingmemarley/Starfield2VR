@@ -1473,16 +1473,28 @@ void UpscalerAfrNvidiaModule::on_present() {
         stats.constants_left, stats.constants_right, stats.constants_routed, stats.constants_other, stats.constants_invalid, stats.constants_laser);
 }
 
-void UpscalerAfrNvidiaModule::on_draw_ui() {
-    if (!ImGui::CollapsingHeader("Upscaler (AFR)")) {
+// (fix196) The F11 menu's Advanced tab: the DLSS model (its group "DLSS", under "View and performance").
+void UpscalerAfrNvidiaModule::on_draw_advanced_ui(int part) {
+    if (part != 1) {
+        return;
+    }
+    if (!menu_ui::group("DLSS")) {
+        return;
+    }
+    m_model->draw("DLSS model");
+    menu_ui::hint("Takes effect from the next menu or loading screen. Needs DLSS 310 or newer (the NVIDIA app's override; the game's own 3.5 "
+                  "keeps its presets); with the NVIDIA app's Model Presets set for the game, this changes nothing. The newer models are "
+                  "sharper and cost more (about 1.3 ms an eye for DLSS 4, 2.4 ms for DLSS 4.5).");
+    ImGui::TextUnformatted(DlssVersionText().c_str());
+}
+
+// (fix196) The Debug tab: per-eye DLSS, DLSS behind menus (a test) and the status.
+void UpscalerAfrNvidiaModule::on_draw_debug_ui() {
+    if (!menu_ui::group("Upscaler (AFR)")) {
         return;
     }
     m_per_eye->draw("Per-eye DLSS (each eye keeps its own DLSS history)");
     m_per_view->draw("Per-view DLSS behind see-through menus (test: the game did not start DLSS there, no anti-aliasing)");
-    m_model->draw("DLSS model (from the next menu or loading screen)");
-    ImGui::TextWrapped("Needs a DLSS 310 or newer (the NVIDIA app's override; the game's own 3.5 keeps its presets). The NVIDIA app's Model Presets "
-                       "set to Recommended or a preset choose for the game: this choice then changes nothing.");
-    ImGui::TextUnformatted(DlssVersionText().c_str());
     const char* why    = WhyNot();
     bool        in_use = false;
     {

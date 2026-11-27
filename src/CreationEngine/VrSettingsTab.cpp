@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -236,10 +237,22 @@ namespace VrSettingsTab
         std::vector<Row> g_rows;
 
         std::string           g_installed{ "not installed" };
+        std::atomic<bool>     g_working{ false }; // (fix198: its hooks in place, set once at Install)
         std::atomic<uint32_t> g_tabs_built{ 0 };
         std::atomic<uint32_t> g_rows_built{ 0 };
         std::atomic<uint32_t> g_changes{ 0 };
         std::atomic<uint32_t> g_thread_logged{ 0 }; // (a bit for each place)
+        std::atomic<uint32_t> g_resets{ 0 };
+        // (fix198, the review) The model a VR row's change last came with, on which thread and when (steady clock, ms): our tab's rows can be
+        // asked for again a frame step on (RequestRowsAgain), on that thread only.
+        std::atomic<void*>    g_last_model{ nullptr };
+        std::atomic<uint32_t> g_last_thread{ 0 };
+        std::atomic<int64_t>  g_last_ms{ 0 };
+
+        int64_t NowMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
 
         bool ReadPtr(uintptr_t at, uintptr_t& out)
         {
@@ -318,9 +331,13 @@ namespace VrSettingsTab
             return r.show ? r.show(r.slider->value()) : std::format("{:.2f}", r.slider->value());
         }
 
-        // A stepper's choice now: the combo's, or the one of the slider's values nearest its value.
+        // A stepper's choice now: its own (fix198: get_index), the combo's, or the one of the slider's values nearest its value.
         uint32_t IndexOf(const Row& r)
         {
+            if (r.get_index) {
+                const uint32_t n = static_cast<uint32_t>(r.options.size());
+                return n > 0 ? std::min(r.get_index(), n - 1) : 0;
+            }
             if (r.combo != nullptr) {
                 const int n = static_cast<int>(r.options.size());
                 return static_cast<uint32_t>(std::clamp(r.combo->value(), 0, std::max(n - 1, 0)));
@@ -376,7 +393,7 @@ namespace VrSettingsTab
             alignas(16) uint8_t row[kRowSize];
             g_row_ctor(row);
             SetText(row + kText, r.text.c_str());
-            SetText(row + kDescription, r.description.c_str());
+            SetText(row + kDescription, r.describe ? r.describe().c_str() : r.description.c_str());
             SetValue<uint32_t>(row + kId, kFirstId + static_cast<uint32_t>(index));
             SetValue<uint32_t>(row + kType, static_cast<uint32_t>(r.kind));
             SetValue<uint32_t>(row + kCategory, kTabId);
@@ -428,6 +445,11 @@ namespace VrSettingsTab
 
         void Changed(const Row& r, void* model, const std::string& how)
         {
+            if (model != nullptr) { // (fix198)
+                g_last_model  = model;
+                g_last_thread = GetCurrentThreadId();
+                g_last_ms     = NowMs();
+            }
             if (r.apply) {
                 r.apply();
             }
@@ -475,12 +497,22 @@ namespace VrSettingsTab
                 LogThread(8, "the stepper handler (a VR row)");
                 const Row& r = g_rows[id - kFirstId];
                 if (r.kind == Kind::Stepper && index < r.options.size() && index != IndexOf(r)) {
-                    if (r.combo != nullptr) {
+                    auto* model = static_cast<uint8_t*>(sink) - kStepperSpot.model_offset;
+                    if (r.set_index) {
+                        // (fix198) Its own setter: refused, the row (and its description, saying why) shown again as it is.
+                        if (!r.set_index(index)) {
+                            g_request_tab(model, static_cast<uint8_t>(kTabId));
+                            if (g_changes.fetch_add(1) < 200) {
+                                spdlog::info("[VrTab] (fix198) {} -> {}: refused", r.text, r.options[index]);
+                            }
+                            return ret;
+                        }
+                    } else if (r.combo != nullptr) {
                         r.combo->value() = static_cast<int32_t>(index);
                     } else if (r.slider != nullptr && index < r.values.size()) {
                         r.slider->value() = r.values[index];
                     }
-                    Changed(r, static_cast<uint8_t*>(sink) - kStepperSpot.model_offset, r.options[index]);
+                    Changed(r, model, r.options[index]);
                 }
             }
             return ret;
@@ -555,6 +587,9 @@ namespace VrSettingsTab
                 if (r.combo != nullptr) {
                     r.combo->value() = r.combo->default_value();
                 }
+                if (r.reset) {
+                    r.reset(); // (fix198: a row over no one setting, the eye mode)
+                }
             }
             for (const Row& r : g_rows) {
                 if (r.apply) {
@@ -565,7 +600,10 @@ namespace VrSettingsTab
                 g_framework->request_save_config();
             }
             g_reset_tab(model, static_cast<uint8_t>(kTabId));
-            spdlog::info("[VrTab] (fix186) Defaults on the VR tab: its settings put back to the mod's defaults");
+            if (g_resets.fetch_add(1) < 20) { // (fix198, the review: capped)
+                spdlog::info("[VrTab] (fix186) Defaults on the VR tab: its settings put back to the mod's defaults (the eye mode Full stereo, "
+                             "the sharpness 1.0)");
+            }
             return 1;
         }
 
@@ -611,7 +649,8 @@ namespace VrSettingsTab
         for (auto& r : rows) {
             // (A row without its setting is shown as a header.)
             if ((r.kind == Kind::Checkbox && r.toggle == nullptr) || (r.kind == Kind::Slider && r.slider == nullptr) ||
-                (r.kind == Kind::Stepper && r.combo == nullptr && (r.slider == nullptr || r.values.size() != r.options.size())) ||
+                (r.kind == Kind::Stepper && r.combo == nullptr && !(r.get_index && r.set_index) &&
+                    (r.slider == nullptr || r.values.size() != r.options.size())) ||
                 (r.kind == Kind::Stepper && r.options.empty())) {
                 spdlog::warn("[VrTab] (fix186) the row \"{}\" has no setting: shown as a heading", r.text);
                 r.kind = Kind::Header;
@@ -779,9 +818,27 @@ namespace VrSettingsTab
             return;
         }
         g_installed = "hooked";
+        g_working   = true; // (fix198)
         spdlog::info("[VrTab] (fix186) a VR tab (id {}) in the game's Settings with {} rows (ids {:#x}-{:#x}): the tabs' build (rva {:x}), the rows' "
                      "build (rva {:x}) and the checkbox, slider, stepper and Defaults handlers hooked",
             kTabId, g_rows.size(), kFirstId, kFirstId + g_rows.size() - 1, kTabsHookRva, kRowsHookRva);
+    }
+
+    bool Working()
+    {
+        return g_working.load();
+    }
+
+    // (fix198, the review) As a changed row asks for them (Changed), within 2 s of a change and on its handler's thread only (the game's
+    // Settings is still open then; its model is the game's one Settings data model).
+    void RequestRowsAgain()
+    {
+        void* const model = g_last_model.load();
+        if (!g_working.load() || g_request_tab == nullptr || model == nullptr || g_last_thread.load() != GetCurrentThreadId() ||
+            NowMs() - g_last_ms.load() > 2000) {
+            return;
+        }
+        g_request_tab(model, static_cast<uint8_t>(kTabId));
     }
 
     std::string Status()

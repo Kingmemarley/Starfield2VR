@@ -124,6 +124,8 @@ namespace GameFlow {
     bool isStarMapShown(int withinMs = 300);
     // (fix173) The hand scanner drawn within this long (isScannerOpen: 0.3 s; shorter for what must end as soon as it closes).
     bool isScannerDrawnWithin(int withinMs);
+    // (fix194) A full-screen menu (not the cursor) drawn within this long: a menu still counted as shown with none drawn lately is closing.
+    bool isFullscreenMenuDrawnWithin(int withinMs);
     // (fix157) The favorites menu (Interface/FavoritesMenu.swf, drawn in the HUD layer: not a menu by the count) drawn within the last 0.3 s.
     bool isFavoritesShown();
     // (fix175) Build mode (Interface/WorkshopMenu.swf: ship decorating, outpost building; a HUD-like screen, not a menu by the count, the world

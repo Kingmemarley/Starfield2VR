@@ -14,7 +14,8 @@ public:
     [[nodiscard]] inline std::string_view get_name() const override { return "StarFieldSettings"; }
 
     std::optional<std::string> on_initialize() override;
-    void                       on_draw_ui() override;
+    void                       on_draw_advanced_ui(int part) override; // (fix196: throwing, drawing for performance)
+    void                       on_draw_debug_ui() override;            // (fix196: the drawing tests)
     void                       on_config_load(const utility::Config& cfg, bool set_default) override;
     void                       on_config_save(utility::Config& cfg) override;
     void                       on_frame() override;

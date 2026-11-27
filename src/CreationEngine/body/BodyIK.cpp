@@ -27,7 +27,10 @@
 #include <CreationEngine/LeftWeapon.h>
 #include <CreationEngine/MeleeThrow.h>
 #include <CreationEngine/Physical.h>
+#include <CreationEngine/SeatView.h>
 #include <ModSettings.h>
+#include <CreationEngine/HandActions.h>
+#include <CreationEngine/Haptics.h>
 #include <CreationEngine/memory/GameCode.h>
 #include <CreationEngine/memory/ScanHelper.h>
 #include <CreationEngine/models/GameFlow.h>
@@ -244,6 +247,17 @@ namespace body
                     SetAppCulled(FaceNode(player), false);
                 }
             }
+            // (fix199) Seated with the view at the seated body's eyes (SeatView): its face hidden meanwhile, as on a ladder.
+            static bool seat_face = false;
+            if (SeatView::FaceHidden()) {
+                SetAppCulled(FaceNode(player), true);
+                seat_face = true;
+            } else if (seat_face) {
+                seat_face = false;
+                if (!g_state.active && !LadderClimb::ViewAtHead()) {
+                    SetAppCulled(FaceNode(player), false);
+                }
+            }
         }
 
         // A tracked hand in game world space.
@@ -313,10 +327,14 @@ namespace body
         }
 
         // (fix169: `place_out`, the camera root's place it was put from, the view's lowering in: LeftCopyShift compares the copy's with that one.)
-        std::optional<HandTarget> HandWorld(const glm::mat4& pose, glm::vec3* place_out = nullptr)
+        // (fix195) `carry_turn`: the room's turn as it will be this frame (tracking::RoomRotationNow, no setting): the camera hook sets it
+        // after the body is placed, so while you turned with the stick the gun was placed with the frame before's turn, a frame behind the
+        // view. Only for the gun and the hands on it (the second review): held things, the left hand's weapon's copy, grenades and grips
+        // on people and walls are placed with the frame before's room, and a hand carried on alone would separate from what it holds.
+        std::optional<HandTarget> HandWorld(const glm::mat4& pose, glm::vec3* place_out = nullptr, bool carry_turn = false)
         {
             auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            const auto room   = tracking::RoomRotation();
+            const auto room   = carry_turn ? tracking::RoomRotationNow() : tracking::RoomRotation();
             if (!world_camera || !world_camera->parent || !room) {
                 return std::nullopt;
             }
@@ -2900,6 +2918,9 @@ namespace body
             bool            from_muzzle{ false };
             // (fix135) Since when the weapon out has been a gun by its read type (the muzzle taken only after a quarter second of it).
             std::chrono::steady_clock::time_point gun_since{};
+            // (fix195) The barrel from the model's own transforms is in use this frame but not kept yet (the estimate starts over if it
+            // stops before it is kept).
+            bool provisional{ false };
         };
         WeaponBasis       g_basis;
         std::atomic<bool> g_fire_sample{ false };
@@ -3024,9 +3045,26 @@ namespace body
             } else if (g_basis.gun_since == std::chrono::steady_clock::time_point{}) {
                 g_basis.gun_since = gun_now;
             }
-            if (auto muzzle = g_basis.muzzle; muzzle != nullptr && g_place.node != nullptr && gun && ++g_basis.muzzle_frames >= 10 &&
-                gun_now - g_basis.gun_since >= std::chrono::milliseconds(250)) {
-                const auto muzzle_way = glm::transpose(FromNi(g_place.node->world).r) * FromNi(muzzle->world).r[1];
+            // (fix195) The muzzle's way in the weapon from the model's own transforms (its local transforms up to the weapon node), as
+            // Homard's Starfield VR reads it from the model: right from the gun's first frame in the hand, with no wait for the model's
+            // first drawn frames (before, the gun was held by the game's draw-animation hold for its first quarter second, up to 73 degrees
+            // off in the last test, then snapped to the barrel). It is used once the weapon has been a gun by its read type for 0.12 s
+            // (past HandGrab's 0.1 s re-read of the type: just after a gun-to-saber swap the type can still be the gun's, and a saber's
+            // model held along its ProjectileNode is held backwards, fix135; the review), and kept for good once the draw is over (the
+            // weapon out, state 3: the up below is the game's hold, which turns during the draw), after 3 frames and 0.15 s. Before it is
+            // kept, a frame without it starts the estimate over. (No setting: it replaces the old wait.)
+            if (auto muzzle = g_basis.muzzle; muzzle != nullptr && g_place.node != nullptr && gun &&
+                gun_now - g_basis.gun_since >= std::chrono::milliseconds(120)) {
+                glm::vec3 muzzle_way{ 0.0f };
+                glm::mat3 chain{ 1.0f };
+                RE::NiAVObject* node = muzzle;
+                for (int i = 0; i < 24 && node != nullptr && node != g_place.node; ++i) {
+                    chain = FromNi(node->local).r * chain;
+                    node  = node->parent;
+                }
+                if (node == g_place.node) {
+                    muzzle_way = chain[1];
+                }
                 // (fix147: a gun's muzzle trusted however far it is from the hold's estimate: the gun's shot point is where the game fires along;
                 // fix146's test had a gun drawn 67-74 degrees off for its first moments, the estimate from its draw animation, the muzzle refused for
                 // being 45 degrees from it; only a gun's (HandGrab::GunKnownOut), as before: a saber's is along its hilt, fix135.)
@@ -3035,18 +3073,32 @@ namespace body
                     const glm::vec3 barrel = glm::normalize(muzzle_way);
                     const glm::vec3 square = up - barrel * glm::dot(up, barrel);
                     if (glm::length(square) > 0.1f) {
-                        spdlog::info("[BodyIK] the barrel from the gun's muzzle: ({:.2f},{:.2f},{:.2f}) in weapon space, {:.1f} deg from the "
-                                     "game's hold (this gun's from now on)",
-                            barrel.x, barrel.y, barrel.z, glm::degrees(std::acos(std::clamp(glm::dot(barrel, forward), -1.0f, 1.0f))));
                         g_basis.forward     = barrel;
                         g_basis.up          = glm::normalize(square);
                         g_basis.has         = true;
-                        g_basis.fired       = true; // (as good as a shot's: not changed by the hold any more)
-                        g_basis.from_muzzle = true;
+                        g_basis.provisional = true;
+                        // (Kept after 0.6 s whatever the weapon's state says, as before fix195 it was after 0.25 s: never left unkept.)
+                        const auto since    = gun_now - g_basis.gun_since;
+                        const bool keep     = ++g_basis.muzzle_frames >= 3 && since >= std::chrono::milliseconds(150) &&
+                                          (GameFlow::weaponState() == 3 || since >= std::chrono::milliseconds(600));
+                        if (keep) {
+                            spdlog::info("[BodyIK] the barrel from the gun's muzzle: ({:.2f},{:.2f},{:.2f}) in weapon space (fix195: from the model's "
+                                         "own transforms, used from its first frame, kept after {} frames), {:.1f} deg from the game's hold (this "
+                                         "gun's from now on)",
+                                barrel.x, barrel.y, barrel.z, g_basis.muzzle_frames,
+                                glm::degrees(std::acos(std::clamp(glm::dot(barrel, forward), -1.0f, 1.0f))));
+                            g_basis.fired       = true; // (as good as a shot's: not changed by the hold any more)
+                            g_basis.from_muzzle = true;
+                            g_basis.provisional = false;
+                        }
                         g_fire_sample.store(false);
                         return;
                     }
                 }
+            }
+            if (g_basis.provisional) {
+                g_basis.provisional = false;
+                g_basis.has         = false; // (the estimate starts over from the hold, not from the barrel used meanwhile)
             }
             const bool fired     = g_fire_sample.exchange(false);
             if (fired || !g_basis.has) {
@@ -3384,7 +3436,9 @@ namespace body
                 return;
             }
             static auto vr    = VR::get();
-            auto        input = vr->get_finger_state(side == 0);
+            // (fix198) The fingers of the controller this hand follows: finger input is by physical controller (index 1 the physical left),
+            // the hands by "Swap Controller Inputs" as their poses (HandGrab, HandActions); before, swapped controllers crossed them.
+            auto        input = vr->get_finger_state((side == 0 ? vr->get_left_controller_index() : vr->get_right_controller_index()) == 1);
             // (fix159) A hand holding a melee weapon (the right one held by its own model; the left hand's weapon in it): a full fist (the fingers
             // kept closed while holding a melee weapon; closed around the grip's small box, the ring and little fingers stayed out).
             const bool melee_fist = side == 1 ? g_right_melee_fist : LeftWeapon::Held() && !MeleeThrow::Away(true);
@@ -4030,6 +4084,530 @@ namespace body
             return true;
         }
 
+        // ---- (fix195) "Lock the gun's grip" ----
+        // How the hand holds the gun (hand_in_weapon: the right wrist in the weapon's space) and where the left hand's support grip is
+        // on it (support_in_weapon) were copied from the hidden first-person rig every frame. Its animation moves them a little all the
+        // time (idle sway, a shot's kick, walking), and with the gun placed by your controller that moved the gun in your hand, and the
+        // support point moved the two-handed aim line with it. Homard's Starfield VR locks both for each weapon once they hold still (FRIK
+        // in Fallout 4 VR keeps a fixed offset per weapon). Here each is taken once it has held still for kGripSteadyFrames frames with
+        // the gun out (not being drawn or put away), no reload and no shot in the last kShotQuietUs, and then kept for that gun. Live (the
+        // animation's, as before) while the gun is drawn or put away and during a reload (kReloadLiveUs after the reload button), then
+        // taken again; from scratch for a new gun. A lock the animation stays far from (kGripRetakeMove/Turn) for kGripRetakeUs with no
+        // reload or shot, while the animation's grip itself holds still (a bad moment taken), is taken again there. "Holding still": the
+        // whole window of kGripSteadyFrames within kGripSteadyMove and kGripSteadyTurn of its first frame (the review: judged frame by frame
+        // a slow drift, the settling after a draw, passed as still).
+        constexpr int     kGripSteadyFrames = 12;
+        constexpr float   kGripSteadyMove   = 0.003f;    // m over the window
+        constexpr float   kGripSteadyTurn   = 1.0f;      // degrees over the window
+        constexpr int64_t kReloadLiveUs     = 2'500'000; // Starfield's reloads take about 1.5-3 s
+        constexpr int64_t kShotQuietUs      = 300'000;
+        constexpr float   kGripRetakeMove   = 0.04f;
+        constexpr float   kGripRetakeTurn   = 12.0f;
+        constexpr int64_t kGripRetakeUs     = 1'000'000;
+        // (fix195, the second review) After a reload: the lock from before it kept as the reference; once the reload's live time is over,
+        // locked again as soon as the animation's grip is back within kReloadBackMove/Turn of it (the live grip taken then), else once it
+        // has held still for kReloadStillUs; live while it moves, up to kReloadSettleUs after the button (then the usual rule). At the button
+        // the lock goes over to the live grip over kReloadBlendUs (no one-frame jump).
+        constexpr float   kReloadBackMove   = 0.01f;
+        constexpr float   kReloadBackTurn   = 4.0f;
+        constexpr int64_t kReloadStillUs    = 1'000'000;
+        constexpr int64_t kReloadSettleUs   = 6'000'000;
+        constexpr int64_t kReloadBlendUs    = 150'000;
+        // (fix198) After a draw: no lock until the gun has been out (state 3) for kDrawSettleUs and the animation's grip has held still
+        // for kLockStillUs (a test locked the Grendel's grip mid-draw, 88 degrees off, for over a second). A lock the animation is far
+        // from (over kGripFarMove or kGripFarTurn) for kGripFarFrames frames with no reload or shot is taken again at once there.
+        constexpr int64_t kDrawSettleUs     = 500'000;
+        constexpr int64_t kLockStillUs      = 500'000;
+        constexpr float   kGripFarMove      = 0.03f;
+        constexpr float   kGripFarTurn      = 30.0f;
+        constexpr int     kGripFarFrames    = 3;
+        // (fix195) Two-handed: no steering of the gun by the left hand when its grip on the gun is this close to the gun hand's (a pistol's
+        // cupped hand): a hand's few millimetres of tremor turned the gun by degrees over so short a line (FRIK asks 15 game units
+        // between the hands before the off hand grips). The left hand is still drawn on the gun.
+        constexpr float kSupportMinLever = 0.15f;
+        // (fix195) "Virtual stock" (Homard's): two-handed with the gun hand within kStockReach of its shoulder, the aim line starts up to
+        // kStockShare of the way from the gun hand toward the shoulder (full share at kStockReach - kStockFade), which is steadier than a
+        // hand. Not with the other hand within kStockMinFront of the shoulder. Onward and Pavlov steady two-handed aim the same way. The
+        // shoulder: below and beside your head, by the body's facing (stage space: kShoulderSide out, kShoulderDown down, kShoulderBack
+        // behind).
+        constexpr float kStockShare    = 0.25f;
+        constexpr float kStockReach    = 0.42f;
+        constexpr float kStockFade     = 0.18f;
+        constexpr float kStockMinFront = 0.18f;
+        constexpr float kShoulderSide  = 0.19f;
+        constexpr float kShoulderDown  = 0.15f;
+        constexpr float kShoulderBack  = 0.05f;
+
+        struct GripLockHand
+        {
+            bool    have_start{ false };
+            Xf      start{};          // the animation's grip as the window of still frames began
+            int64_t start_us{ 0 };    // ...and when
+            int     steady{ 0 };      // frames since, all within the window's bounds of it
+            bool    locked{ false };
+            Xf      held{};
+            int64_t far_since_us{ 0 };
+            bool    has_ref{ false }; // (a reload) the lock from before it
+            Xf      ref{};
+            bool    blend{ false };   // (a reload) from the lock to the live grip
+            Xf      blend_from{};
+            int64_t blend_at_us{ 0 };
+            int     far_frames{ 0 };  // (fix198) frames in a row the animation's grip was far from the lock
+            // For the log: how far the animation's live grip was from the lock (what the lock kept out of the gun), and frames live.
+            double  drift_sum{ 0.0 };
+            float   drift_max{ 0.0f };
+            double  drift_turn_sum{ 0.0 };
+            float   drift_turn_max{ 0.0f };
+            int     drift_n{ 0 };
+            int     live_frames{ 0 };
+        };
+        struct GripLock
+        {
+            uint32_t        form{ 0 };
+            RE::NiAVObject* weapon{ nullptr };       // the body's node placed in the hand (g_place.node)
+            RE::NiAVObject* first_weapon{ nullptr }; // the hidden first-person rig's
+            RE::NiAVObject* muzzle{ nullptr };       // the gun's muzzle: a new model at a swap has a new one
+            int64_t         reload_seen_us{ 0 };
+            bool            capture_ok{ false };     // this frame: the gun out, no reload, no shot just now
+            bool            live_forced{ false };    // this frame: being drawn or put away, or reloading
+            bool            settling{ false };       // this frame: within kReloadSettleUs of the reload button
+            int64_t         out_since_us{ 0 };       // (fix198) since when the gun has been out (state 3); 0 while it is not
+            GripLockHand    hand[2];                 // 0 the support (left) hand's grip, 1 the gun hand's
+            int             locks{ 0 }, retakes{ 0 }, reloads{ 0 }, short_frames{ 0 }, stock_frames{ 0 }, frames{ 0 };
+            float           stock_max{ 0.0f };
+            int             lock_logs{ 0 };
+            int             far_logs{ 0 };           // (fix198: the at-once retakes' own cap)
+            int             two_handed_frames{ 0 }, near_frames{ 0 }; // (fix198) for the log: held in both hands; near, drawn on, not held
+            int             unlocked_frames{ 0 };    // (fix198) held in both hands but not steered: its support grip not locked yet
+        };
+        GripLock g_grip_lock;
+
+        int64_t SteadyNowUs()
+        {
+            return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        // The turn between two rotations, degrees (from the quaternion of their difference: exact near 0, unlike acos of the trace).
+        float TurnDegrees(const glm::mat3& a, const glm::mat3& b)
+        {
+            const glm::quat q = glm::normalize(glm::quat_cast(a * glm::transpose(b)));
+            return glm::degrees(2.0f * std::atan2(glm::length(glm::vec3{ q.x, q.y, q.z }), std::abs(q.w)));
+        }
+
+        // From one grip to another, t from 0 (a) to 1 (b).
+        Xf BlendXf(const Xf& a, const Xf& b, float t)
+        {
+            Xf out{};
+            out.r = glm::mat3_cast(glm::slerp(glm::normalize(glm::quat_cast(a.r)), glm::normalize(glm::quat_cast(b.r)), t));
+            out.t = glm::mix(a.t, b.t, t);
+            out.s = a.s + (b.s - a.s) * t;
+            return out;
+        }
+
+        // Once a frame with a gun out: a new gun (form, model, muzzle) starts over; a reload tap lets go of both locks; whether a grip may
+        // be taken this frame, or must be the animation's.
+        void GripLockFrame(uint32_t form, RE::NiAVObject* first_weapon, int64_t now)
+        {
+            auto&                 g      = g_grip_lock;
+            RE::NiAVObject* const muzzle = g_body_muzzle.load();
+            if (form != g.form || g_place.node != g.weapon || first_weapon != g.first_weapon || muzzle != g.muzzle) {
+                g.form         = form;
+                g.weapon       = g_place.node;
+                g.first_weapon = first_weapon;
+                g.muzzle       = muzzle;
+                g.hand[0]      = GripLockHand{};
+                g.hand[1]      = GripLockHand{};
+                g.out_since_us = 0; // (fix198: a new gun's draw settles anew)
+            }
+            const int64_t tap = haptics::LastReloadTapUs();
+            if (tap > g.reload_seen_us) {
+                g.reload_seen_us = tap;
+                if (g.reload_seen_us > 0) {
+                    ++g.reloads;
+                    for (auto& h : g.hand) {
+                        if (h.locked) {
+                            h.has_ref     = true;
+                            h.ref         = h.held;
+                            h.blend       = true;
+                            h.blend_from  = h.held;
+                            h.blend_at_us = now;
+                        }
+                        h.locked     = false;
+                        h.steady     = 0;
+                        h.have_start = false;
+                    }
+                }
+            }
+            const bool reloading = g.reload_seen_us > 0 && now - g.reload_seen_us < kReloadLiveUs;
+            g.settling           = g.reload_seen_us > 0 && now - g.reload_seen_us < kReloadSettleUs;
+            const bool out       = GameFlow::weaponState() == 3;
+            if (!out) {
+                g.out_since_us = 0;
+            } else if (g.out_since_us == 0) {
+                g.out_since_us = now;
+            }
+            g.live_forced        = !out || reloading;
+            g.capture_ok         = !g.live_forced && now - haptics::LastFiredUs() > kShotQuietUs;
+            ++g.frames;
+        }
+
+        // The grip to use this frame (which: 0 the support hand's, 1 the gun hand's): the locked one, or the animation's live one.
+        Xf GripLockUse(int which, const Xf& live, int64_t now)
+        {
+            auto& g = g_grip_lock;
+            auto& h = g.hand[which];
+            if (h.have_start && glm::length(live.t - h.start.t) < kGripSteadyMove && TurnDegrees(live.r, h.start.r) < kGripSteadyTurn) {
+                ++h.steady;
+            } else {
+                h.start      = live;
+                h.start_us   = now;
+                h.have_start = true;
+                h.steady     = 0;
+            }
+            // The live grip, eased in from the lock over kReloadBlendUs after the reload button.
+            const auto live_now = [&]() -> Xf {
+                ++h.live_frames;
+                if (h.blend && now - h.blend_at_us < kReloadBlendUs) {
+                    return BlendXf(h.blend_from, live, std::clamp(static_cast<float>(now - h.blend_at_us) / kReloadBlendUs, 0.0f, 1.0f));
+                }
+                h.blend = false;
+                return live;
+            };
+            if (g.live_forced) {
+                h.locked       = false;
+                h.far_since_us = 0;
+                return live_now();
+            }
+            if (!h.locked) {
+                bool take = false;
+                if (h.has_ref && g.settling) {
+                    // After a reload: back where it was held before, or holding still a second.
+                    const bool back  = glm::length(live.t - h.ref.t) < kReloadBackMove && TurnDegrees(live.r, h.ref.r) < kReloadBackTurn;
+                    const bool still = h.steady > 0 && now - h.start_us >= kReloadStillUs;
+                    take             = g.capture_ok && (back || still);
+                } else {
+                    // (fix198) Out long enough for the draw to have settled, and still for kLockStillUs (not only kGripSteadyFrames).
+                    h.has_ref = false;
+                    take      = g.capture_ok && h.steady >= kGripSteadyFrames && now - h.start_us >= kLockStillUs && g.out_since_us != 0 &&
+                           now - g.out_since_us >= kDrawSettleUs;
+                }
+                if (!take) {
+                    return live_now();
+                }
+                h.locked       = true;
+                h.held         = live;
+                h.far_since_us = 0;
+                h.far_frames   = 0;
+                h.blend        = false;
+                ++g.locks;
+                if (g.lock_logs < 40) {
+                    ++g.lock_logs;
+                    spdlog::info("[BodyIK] (fix195) the {} grip on the gun {:08X} locked ({}; fix198: {:.1f} s after the gun came out): kept for this "
+                                 "gun, live again only while it is drawn, put away or reloaded",
+                        which == 1 ? "gun hand's" : "support hand's", g.form,
+                        h.has_ref ? "after the reload, back as before it or holding still" : "held still",
+                        g.out_since_us != 0 ? static_cast<double>(now - g.out_since_us) * 1e-6 : 0.0);
+                }
+                h.has_ref = false;
+            }
+            const float move = glm::length(live.t - h.held.t);
+            const float turn = TurnDegrees(live.r, h.held.r);
+            if (std::isfinite(move) && std::isfinite(turn)) {
+                h.drift_sum += move;
+                h.drift_max = std::max(h.drift_max, move);
+                h.drift_turn_sum += turn;
+                h.drift_turn_max = std::max(h.drift_turn_max, turn);
+                ++h.drift_n;
+            }
+            // (fix198) Far off (a wrong lock, such as one taken mid-draw): taken again at once, after kGripFarFrames frames, but only at a
+            // pose the animation rests in (its grip held still kGripSteadyFrames, the review: not in the middle of a move, such as a reload
+            // the button did not start).
+            h.far_frames = g.capture_ok && (move > kGripFarMove || turn > kGripFarTurn) && h.steady >= kGripSteadyFrames ? h.far_frames + 1 : 0;
+            if (h.far_frames >= kGripFarFrames) {
+                h.held         = live;
+                h.far_frames   = 0;
+                h.far_since_us = 0;
+                ++g.retakes;
+                if (g.far_logs < 40) {
+                    ++g.far_logs;
+                    spdlog::info("[BodyIK] (fix198) the {} grip on the gun {:08X}: the animation {:.3f} m and {:.1f} deg from the lock for {} frames "
+                                 "with no reload or shot: taken again there at once",
+                        which == 1 ? "gun hand's" : "support hand's", g.form, move, turn, kGripFarFrames);
+                }
+                return live;
+            }
+            if (g.capture_ok && (move > kGripRetakeMove || turn > kGripRetakeTurn)) {
+                if (h.far_since_us == 0) {
+                    h.far_since_us = now;
+                } else if (now - h.far_since_us > kGripRetakeUs && h.steady >= kGripSteadyFrames) {
+                    // (The review: only once the animation's grip itself holds still there, not in the middle of a move such as a reload
+                    // the button did not start, an empty magazine's.)
+                    h.held         = live;
+                    h.far_since_us = 0;
+                    ++g.retakes;
+                    if (g.lock_logs < 40) {
+                        ++g.lock_logs;
+                        spdlog::info("[BodyIK] (fix195) the {} grip on the gun {:08X}: the animation held still {:.3f} m and {:.1f} deg from the lock "
+                                     "for over a second with no reload or shot: taken again there",
+                            which == 1 ? "gun hand's" : "support hand's", g.form, move, turn);
+                    }
+                    return live;
+                }
+            } else {
+                h.far_since_us = 0;
+            }
+            return h.held;
+        }
+
+        // Every 10 s while a gun is out (60 times, then one a minute): the locks and what they kept out of the gun.
+        void GripLockLog()
+        {
+            static TimedLog log;
+            auto&           g = g_grip_lock;
+            if (!log.Due(std::chrono::steady_clock::now(), std::chrono::seconds(10)) || g.frames == 0) {
+                return;
+            }
+            const auto& r = g.hand[1];
+            const auto& l = g.hand[0];
+            spdlog::info("[BodyIK] (fix195) the gun's grip, the last 10 s ({} frames, lock {}): gun hand {} ({} frames live), the animation's grip "
+                         "{:.4f} m and {:.2f} deg from the lock on average (at most {:.4f} m, {:.2f} deg); support hand {} ({} live), {:.4f} m and "
+                         "{:.2f} deg (at most {:.4f}, {:.2f}); {} locks, {} taken again, {} reloads; the left hand not steering a short gun {} frames; "
+                         "the virtual stock in {} frames (its share up to {:.2f}); (fix198) held in both hands (the left grip) {} frames (not steered "
+                         "yet, the support grip not locked: {}), the left hand near and drawn on the gun but not holding it {} frames",
+                g.frames, GameFlow::gStore.internalSettings.lockGunGrip ? "on" : "off", r.locked ? "locked" : "live", r.live_frames,
+                r.drift_n > 0 ? r.drift_sum / r.drift_n : 0.0, r.drift_n > 0 ? r.drift_turn_sum / r.drift_n : 0.0, r.drift_max, r.drift_turn_max,
+                l.locked ? "locked" : "live", l.live_frames, l.drift_n > 0 ? l.drift_sum / l.drift_n : 0.0,
+                l.drift_n > 0 ? l.drift_turn_sum / l.drift_n : 0.0, l.drift_max, l.drift_turn_max, g.locks, g.retakes, g.reloads, g.short_frames,
+                g.stock_frames, g.stock_max, g.two_handed_frames, g.unlocked_frames, g.near_frames);
+            for (auto& h : g.hand) {
+                h.drift_sum = h.drift_turn_sum = 0.0;
+                h.drift_max = h.drift_turn_max = 0.0f;
+                h.drift_n = h.live_frames = 0;
+            }
+            g.locks = g.retakes = g.reloads = g.short_frames = g.stock_frames = g.frames = 0;
+            g.two_handed_frames = g.near_frames = g.unlocked_frames = 0;
+            g.stock_max = 0.0f;
+        }
+
+        // (fix198) The support grip to steer the gun by, two-handed: the locked one, else the one locked before a reload (the review: the
+        // animation's live one moved the aim line with it); with "Lock the gun's grip" on and neither (just drawn, or mid-reload): none, the
+        // gun not steered yet. With the lock off (or not a gun): the live one, as before.
+        bool SupportForSteering(bool lock_grip, const Xf& live, Xf& out)
+        {
+            if (!lock_grip) {
+                out = live;
+                return true;
+            }
+            const auto& h = g_grip_lock.hand[0];
+            if (h.locked) {
+                out = h.held;
+                return true;
+            }
+            if (h.has_ref) {
+                out = h.ref;
+                return true;
+            }
+            return false;
+        }
+
+        // ---- (fix198) Two-handed steering only while the left grip holds the gun ----
+        // The left hand turned the gun onto the line from the gun hand to it whenever it was near the gun's support grip (12 cm in, 25 cm
+        // out), with no button: resting it near the gun while aiming steered the gun off where the right controller pointed (a test with
+        // the cutter: steered in most frames with the left grip not squeezed at all). Now, as in Homard's Starfield VR: squeezing the left
+        // grip with the hand at the gun's support grip (within kGrabReach during the press's attempt: its first kGrabAttemptUs, or as long
+        // as the hand stays within kGrabNear) takes the gun in both hands, and letting go of the grip gives it back to the right hand
+        // alone; so does the left hand ending up over kGrabLetGo from the support grip on the gun as steered (the gun follows the hand, so
+        // only a hand taken off along the gun), the grip becoming another thing's (the favorites wheel open, the grip as LB in the star
+        // map, build mode or the scanner, a climb), a gap of over kGrabGapUs in these updates, or another gun. Without the grip the left
+        // hand is still drawn on the gun when near it, as before, but does not steer it. The steering eases in and out over kGrabBlendUs, with
+        // a tick in the left controller each way (as Homard's). The grip's squeeze is read from the physical controller the left hand
+        // follows ("Swap Controller Inputs", the review).
+        constexpr float   kGrabOn        = 0.6f;
+        constexpr float   kGrabOff       = 0.4f;
+        constexpr float   kGrabReach     = 0.18f;
+        constexpr float   kGrabNear      = 0.30f;
+        constexpr float   kGrabLetGo     = 0.30f;
+        constexpr int64_t kGrabAttemptUs = 300'000;
+        constexpr int64_t kGrabGapUs     = 100'000;
+        constexpr int64_t kGrabBlendUs   = 100'000;
+        struct SupportGrab
+        {
+            bool     squeezed{ false };
+            bool     attempt{ false };
+            bool     grabbing{ false };
+            bool     let_go{ false };  // the hand was found off the gun as steered (after the last update): let go now
+            int64_t  pressed_us{ 0 };
+            int64_t  seen_us{ 0 };
+            uint32_t form{ 0 };
+            float    weight{ 0.0f };   // the steering's share now (0..1), eased over kGrabBlendUs
+            int64_t  weight_us{ 0 };
+            int      logs{ 0 };
+        };
+        SupportGrab g_support_grab;
+        // (fix198) For the gamepad's combos (ModConfig): the gun is held in both hands this update (false when the support was not
+        // looked at: no gun, the support grip off, the left hand's own weapon).
+        std::atomic<bool> g_gun_both_hands{ false };
+
+        // The left grip this frame (its squeeze, with a band) against the support grip's distance: whether the gun is held in both hands.
+        bool SupportGrabUpdate(float distance, uint32_t form, int64_t now)
+        {
+            static auto vr      = VR::get();
+            auto&       sg      = g_support_grab;
+            const float squeeze = vr->get_finger_state(vr->get_left_controller_index() == 1).grip;
+            const bool  before  = sg.grabbing;
+            const char* why     = nullptr;
+            // Not looked at for a while (the support off, a menu, a swap) or another gun: from scratch; a grip held through it is no new press.
+            if (now - sg.seen_us > kGrabGapUs || form != sg.form) {
+                sg.grabbing = false;
+                sg.attempt  = false;
+                sg.squeezed = squeeze > kGrabOn;
+                sg.form     = form;
+                sg.weight   = 0.0f;
+                why         = "a gap or another gun";
+            }
+            sg.seen_us      = now;
+            const bool was  = sg.squeezed;
+            sg.squeezed     = squeeze > (sg.squeezed ? kGrabOff : kGrabOn);
+            if (sg.squeezed && !was) {
+                sg.pressed_us = now;
+                sg.attempt    = true;
+            }
+            if (!sg.squeezed || (now - sg.pressed_us >= kGrabAttemptUs && !(distance < kGrabNear))) {
+                sg.attempt = false;
+            }
+            const bool other = GameFlow::isFavoritesDrawnNow() || HandActions::GripIsShoulder(true) || Climbing::HoldsGrip(true);
+            if (!sg.squeezed || other || sg.let_go) {
+                if (sg.grabbing && why == nullptr) {
+                    why = !sg.squeezed ? "the grip let go" : other ? "the grip is the favorites wheel's, LB's or a climb's" : "the hand off the gun";
+                }
+                sg.grabbing = false;
+                if (other || sg.let_go) {
+                    sg.attempt = false; // (a new press needed)
+                }
+            } else if (!sg.grabbing) {
+                sg.grabbing = sg.attempt && distance < kGrabReach;
+            }
+            sg.let_go = false;
+            // The steering's share, eased.
+            const float dt = sg.weight_us != 0 ? std::clamp(static_cast<float>(now - sg.weight_us) * 1e-6f, 0.0f, 0.1f) : 0.0f;
+            sg.weight_us   = now;
+            sg.weight      = std::clamp(sg.weight + (sg.grabbing ? dt : -dt) / (kGrabBlendUs * 1e-6f), 0.0f, 1.0f);
+            if (sg.grabbing != before) {
+                haptics::MeleePulse(true, sg.grabbing ? 0.35f : 0.2f, sg.grabbing ? 0.025f : 0.015f);
+                if (sg.logs < 40) {
+                    ++sg.logs;
+                    spdlog::info("[BodyIK] (fix198) two-handed: the left hand {} the gun (left grip {:.2f}, {:.2f} m from its support grip{}{})",
+                        sg.grabbing ? "takes" : "lets go of", squeeze, distance, why != nullptr ? "; " : "", why != nullptr ? why : "");
+                }
+            }
+            return sg.grabbing;
+        }
+
+        // ---- (fix198) The virtual stock steadies the aim, it does not move it ----
+        // fix195's stock turned the gun onto the line from a point partly (up to 25%) at the shoulder to the left hand. That line is not the
+        // hands' line: with the gun held anywhere but against the shoulder it pointed off where the hands did, by several degrees (a test
+        // with the cutter: in use in nearly every frame while mining, aiming off). Now the gun follows the stock line only for fast changes:
+        // the difference between the hands' line and the stock line is followed slowly (kStockBiasTau) and added back, so held still the
+        // gun points exactly along the hands' line (no offset at all), and a quick shake of the gun hand moves it up to a quarter less (the
+        // stock's share). The difference is kept in the stock line's own frame (the review: kept in the world's, a quick turn of the gun
+        // would carry it off the line it belongs to), and with no stock this frame (its share 0) the stock line is the hands' line, so the
+        // difference fades to nothing instead of stopping at once.
+        constexpr float kStockBiasTau = 0.25f; // seconds
+        struct StockFilter
+        {
+            bool      ok{ false };
+            glm::vec3 bias{ 0.0f }; // in the stock line's frame (x right, y along it, z up)
+            int64_t   at_us{ 0 };
+        };
+        StockFilter g_stock_filter;
+
+        // The way the gun points, two-handed: the hands' line (`hands`, from the gun hand's grip to the left hand), steadied by the stock's
+        // (`stock`; the hands' line itself when the stock has no share) for fast changes only. `side_hint` gives the frame its second axis
+        // when the line is near straight up or down (the body's forward). The filter starts over when it was not used for 0.25 s.
+        glm::vec3 SteadiedLine(const glm::vec3& hands, const glm::vec3& stock, const glm::vec3& side_hint, int64_t now)
+        {
+            auto&     f     = g_stock_filter;
+            glm::vec3 up_ax = glm::vec3{ 0.0f, 0.0f, 1.0f };
+            if (std::abs(glm::dot(stock, up_ax)) > 0.95f) {
+                up_ax = side_hint;
+            }
+            const glm::mat3 frame = FrameOf(stock, up_ax);
+            const glm::vec3 diff  = glm::transpose(frame) * (hands - stock);
+            const float     dt    = static_cast<float>(now - f.at_us) * 1e-6f;
+            if (!f.ok || !(dt >= 0.0f && dt < 0.25f) || !std::isfinite(f.bias.x) || !std::isfinite(f.bias.y) || !std::isfinite(f.bias.z)) {
+                f.bias = diff;
+            } else {
+                f.bias += (diff - f.bias) * (1.0f - std::exp(-dt / kStockBiasTau));
+            }
+            f.ok    = true;
+            f.at_us = now;
+            const glm::vec3 way = stock + frame * f.bias;
+            if (!(glm::length(way) > 1e-4f) || !std::isfinite(way.x) || !std::isfinite(way.y) || !std::isfinite(way.z)) {
+                f.ok = false;
+                return hands;
+            }
+            return glm::normalize(way);
+        }
+
+        // (fix195) The virtual stock's rear end of the aim line for a gun held with both hands: the gun hand's grip moved up to kStockShare
+        // toward that hand's shoulder when the hand is near it. `pivot` the gun hand's grip (game world), `body_forward` the body's own
+        // facing (game world: the review: from the headset's look, turning only the head swung the shoulder round and the aim with it);
+        // its share returned in `share`. The shoulder on the side of the physical controller holding the gun (the second review: by where
+        // the hand was beside the head it flipped 0.38 m as the hand crossed the middle; swapped controllers: the left), smoothed over
+        // kShoulderSmooth so a nod or a lean of the head does not steer the aim. The share fades out over kStockFrontFade as the other hand
+        // comes within kStockMinFront of the shoulder (no one-frame switch).
+        constexpr float kShoulderSmooth  = 0.3f;  // seconds
+        constexpr float kStockFrontFade  = 0.05f; // m
+        glm::vec3 StockRear(const glm::vec3& pivot, const glm::vec3& body_forward, float& share)
+        {
+            share = 0.0f;
+            if (!GameFlow::gStore.internalSettings.virtualStock) {
+                return pivot;
+            }
+            glm::vec3 ahead{ 0.0f };
+            if (!tracking::WorldToStageDirection(body_forward, ahead)) {
+                return pivot;
+            }
+            ahead.y = 0.0f;
+            if (!(glm::length(ahead) > 0.2f)) {
+                return pivot;
+            }
+            static auto     vr       = VR::get();
+            const glm::mat4 head     = tracking::HeadPose();
+            ahead                    = glm::normalize(ahead);
+            const glm::vec3 up       = glm::vec3{ 0.0f, 1.0f, 0.0f };
+            const glm::vec3 right    = glm::normalize(glm::cross(ahead, up));
+            const glm::vec3 gun_at   = glm::vec3{ tracking::GripPose(false)[3] };
+            const glm::vec3 left_at  = glm::vec3{ tracking::GripPose(true)[3] };
+            const float     side     = vr->get_right_controller_index() == 1 ? -1.0f : 1.0f; // (index 1: the physical left controller)
+            const glm::vec3 raw      = glm::vec3{ head[3] } + right * (side * kShoulderSide) - up * kShoulderDown - ahead * kShoulderBack;
+            // Smoothed (stage space): at once after a pause or a jump of over 0.15 m (a recentre, the other side).
+            static glm::vec3 smooth{ 0.0f };
+            static auto      smooth_at = std::chrono::steady_clock::time_point{};
+            const auto       now       = std::chrono::steady_clock::now();
+            const float      dt        = std::chrono::duration<float>(now - smooth_at).count();
+            if (smooth_at == std::chrono::steady_clock::time_point{} || !(dt < 0.5f) || !(glm::length(raw - smooth) < 0.15f)) {
+                smooth = raw;
+            } else {
+                smooth += (raw - smooth) * (1.0f - std::exp(-std::max(dt, 0.0f) / kShoulderSmooth));
+            }
+            smooth_at                = now;
+            const glm::vec3 shoulder = smooth;
+            const float     front    = std::clamp((glm::length(left_at - shoulder) - kStockMinFront) / kStockFrontFade, 0.0f, 1.0f);
+            const float     w = std::clamp((kStockReach - glm::length(gun_at - shoulder)) / kStockFade, 0.0f, 1.0f) * kStockShare * front;
+            if (!(w > 0.005f)) {
+                return pivot;
+            }
+            glm::mat4 shoulder_pose{ 1.0f };
+            shoulder_pose[3] = glm::vec4{ shoulder, 1.0f };
+            const auto at    = HandWorld(shoulder_pose, nullptr, HandGrab::GunKnownOut()); // (fix195: as the gun)
+            if (!at || !std::isfinite(at->position.x)) {
+                return pivot;
+            }
+            share = w;
+            return pivot + (at->position - pivot) * w;
+        }
+
         void ApplyIK(const Pose& pose)
         {
             if (g_bones.head >= 0) {
@@ -4074,10 +4652,19 @@ namespace body
                 bool& value;
                 ~StoreSupport() { g_support_on_gun = value; }
             } store_support{ support_on_gun };
+            // (fix198) The same for the gun held in both hands (the gamepad's left-grip combos stand down meanwhile, ModConfig).
+            bool both_hands_now = false;
+            struct StoreBothHands
+            {
+                bool& value;
+                ~StoreBothHands() { g_gun_both_hands.store(value, std::memory_order_relaxed); }
+            } store_both_hands{ both_hands_now };
             auto& r = g_bones.right;
+            // (fix195) The gun and the hands on it placed with this frame's room turn (HandWorld's carry_turn): only with a gun out.
+            const bool gun_turn = HandGrab::GunKnownOut();
             if (r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
-                auto grip = HandWorld(tracking::GripPose(false));
-                auto aim  = HandWorld(tracking::AimPose(false));
+                auto grip = HandWorld(tracking::GripPose(false), nullptr, gun_turn);
+                auto aim  = HandWorld(tracking::AimPose(false), nullptr, gun_turn);
                 SupportShift(false, grip, aim); // (fix170: the second hand on a held object, drawn on its grip)
                 HoldPersonShift(false, grip, aim); // (fix174: on the person it holds)
                 HoldWallShift(false, grip, aim);   // (fix180: on the wall it holds on to)
@@ -4198,6 +4785,14 @@ namespace body
                                 const auto ik_in_weapon = Compose(Inverse(FromNi(g_place.node->world)), FromNi(body_ik->world));
                                 hand_in_weapon          = Compose(ik_in_weapon, hand_from_ik);
                             }
+                            // (fix195) "Lock the gun's grip": a gun's hand-in-weapon kept once it has held still (GripLockUse above), so the
+                            // animation's sway and kick no longer move the gun in the hand.
+                            const bool    lock_grip = GameFlow::gStore.internalSettings.lockGunGrip && HandGrab::GunKnownOut();
+                            const int64_t lock_now  = SteadyNowUs();
+                            if (lock_grip) {
+                                GripLockFrame(HandGrab::WeaponInHandsId(), first_weapon, lock_now);
+                                hand_in_weapon = GripLockUse(1, hand_in_weapon, lock_now);
+                            }
                             Xf         weapon_xf      = Compose(wrist_target, Inverse(hand_in_weapon));
                             // (fix158) A one-handed melee weapon: held by its own model (FixedMeleeHold), the hand where the controller puts it.
                             const bool fixed_melee = HandGrab::OneHandedMeleeOut() && FixedMeleeHold(g_place.node, g_place.model, *aim, *grip, weapon_xf);
@@ -4220,30 +4815,98 @@ namespace body
                             }
                             g_barrel.aim_forward = aim->forward;
 
-                            // Two-handed: the support grip is taken when the left hand comes near it; the weapon then
-                            // turns about the right grip so the support point lies toward the left hand (ROCK).
+                            // Two-handed: the left hand is drawn on the support grip when it comes near it; (fix198) taken with the left
+                            // grip squeezed there, the weapon then turns about the right grip so the support point lies toward the left
+                            // hand (ROCK; Homard's grip-held rule).
                             g_support = {};
                             const auto& l_arm = g_bones.left;
-                            const auto  left_grip = HandWorld(tracking::GripPose(true));
+                            const auto  left_grip = HandWorld(tracking::GripPose(true), nullptr, gun_turn); // (fix195: as the gun)
                             // (fix154: not while the left hand holds its own weapon, dual wielding.)
                             if (GameFlow::gStore.internalSettings.supportHand && first_left && l_arm.shape.valid && left_grip && !LeftWeapon::Held() && !fixed_melee) {
                                 MeasureFirstPersonHand(first_left, true);
                                 if (g_first_hands[0].shape.valid) {
-                                    const auto support_in_weapon = Compose(Inverse(FromNi(first_weapon->world)),
+                                    auto support_in_weapon = Compose(Inverse(FromNi(first_weapon->world)),
                                         BodyWristFromFirstPerson(FromNi(first_left->world), l_arm.shape, true));
+                                    // (fix195) The support grip's place on the gun locked as the gun hand's is: the aim line no longer
+                                    // follows the animation's left hand.
+                                    if (lock_grip) {
+                                        support_in_weapon = GripLockUse(0, support_in_weapon, lock_now);
+                                    }
                                     auto support = Compose(weapon_xf, support_in_weapon);
                                     auto palm    = support.t + support.r * (l_arm.shape.forward * l_arm.shape.palm) * support.s;
                                     const float distance    = glm::length(palm - left_grip->position);
                                     static bool held        = false;
-                                    held                    = distance < (held ? 0.25f : 0.12f);
+                                    // (fix198) Taken in both hands (the left grip squeezed at the support grip, SupportGrabUpdate): steers the
+                                    // gun, easing in and out (its weight). Only near it: the left hand drawn on the gun, as before, without
+                                    // steering it.
+                                    const bool  two_handed  = SupportGrabUpdate(distance, HandGrab::WeaponInHandsId(), lock_now);
+                                    const float steer_w     = g_support_grab.weight;
+                                    held                    = two_handed || steer_w > 0.0f || distance < (held ? 0.25f : 0.12f);
                                     g_diag.support_distance = distance;
+                                    both_hands_now          = two_handed;
+                                    bool steered            = false;
                                     if (held) {
                                         const auto pivot = grip->position;
-                                        const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
-                                        weapon_xf.r      = turn * weapon_xf.r;
-                                        weapon_xf.t      = pivot + turn * (weapon_xf.t - pivot);
-                                        wrist_target.r   = turn * wrist_target.r;
-                                        wrist_target.t   = pivot + turn * (wrist_target.t - pivot);
+                                        // (fix198) The support point the gun is steered by: the locked one, else the one locked before a reload;
+                                        // with "Lock the gun's grip" on and neither, none (the review: not one the animation still moves); off,
+                                        // the live one as before. The left hand is still drawn at the support grip as it is now (below).
+                                        Xf         steer_support{};
+                                        const bool have_steer = SupportForSteering(lock_grip, support_in_weapon, steer_support);
+                                        const Xf   steer_world = Compose(weapon_xf, steer_support);
+                                        const auto steer_palm  = steer_world.t + steer_world.r * (l_arm.shape.forward * l_arm.shape.palm) * steer_world.s;
+                                        const float lever = glm::length(steer_palm - pivot);
+                                        // (fix195) A short gun (the left hand cupping the gun hand): held, not steered. With a band (steered
+                                        // from kSupportMinLever + 1 cm, not from under kSupportMinLever - 2 cm), so a grip near the limit does
+                                        // not flip between the two (the review). Part of "Lock the gun's grip" (off: steered as before fix195).
+                                        static bool steer = true;
+                                        steer = !GameFlow::gStore.internalSettings.lockGunGrip ||
+                                                (steer ? lever >= kSupportMinLever - 0.02f : lever >= kSupportMinLever + 0.01f);
+                                        if (!(steer_w > 0.0f)) {
+                                            // (fix198) Not taken with the grip: the gun stays on the right hand's aim.
+                                        } else if (!have_steer) {
+                                            ++g_grip_lock.unlocked_frames;
+                                        } else if (!steer || !std::isfinite(lever)) {
+                                            ++g_grip_lock.short_frames;
+                                        } else {
+                                            // (fix195) The aim line's rear end: the gun hand, or partly the shoulder (the virtual stock);
+                                            // (fix198) the stock's line used for fast changes only (SteadiedLine): held still, the hands' line.
+                                            // With no share this frame the stock's line is the hands' own, so the filter's difference fades.
+                                            const glm::vec3 body_forward = pose.to_world.r * pose.root.r[1];
+                                            float           share        = 0.0f;
+                                            const glm::vec3 rear         = StockRear(pivot, body_forward, share);
+                                            if (share > 0.0f) {
+                                                ++g_grip_lock.stock_frames;
+                                                g_grip_lock.stock_max = std::max(g_grip_lock.stock_max, share);
+                                            }
+                                            const glm::vec3 hands_way = left_grip->position - pivot;
+                                            const glm::vec3 stock_way = left_grip->position - rear;
+                                            if (glm::length(hands_way) > 1e-3f && glm::length(stock_way) > 1e-3f &&
+                                                glm::length(steer_palm - pivot) > 1e-3f) {
+                                                const glm::vec3 hands_n = glm::normalize(hands_way);
+                                                const glm::vec3 way     = SteadiedLine(hands_n, share > 0.0f ? glm::normalize(stock_way) : hands_n,
+                                                    body_forward, lock_now);
+                                                glm::mat3 turn = RotationBetween(steer_palm - pivot, way);
+                                                if (steer_w < 1.0f) {
+                                                    // (fix198) Easing in or out: part of the turn (the review: no one-frame jump at a grab or let-go).
+                                                    turn = glm::mat3_cast(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, glm::normalize(glm::quat_cast(turn)),
+                                                        steer_w));
+                                                }
+                                                weapon_xf.r     = turn * weapon_xf.r;
+                                                weapon_xf.t     = pivot + turn * (weapon_xf.t - pivot);
+                                                wrist_target.r  = turn * wrist_target.r;
+                                                wrist_target.t  = pivot + turn * (wrist_target.t - pivot);
+                                                steered         = true;
+                                                // (fix198) The left hand taken off along the gun (the gun follows it, so the distance before the turn
+                                                // says nothing then): over kGrabLetGo from the support grip as steered, let go at the next update.
+                                                if (two_handed && steer_w >= 1.0f) {
+                                                    const Xf   after      = Compose(weapon_xf, steer_support);
+                                                    const auto after_palm = after.t + after.r * (l_arm.shape.forward * l_arm.shape.palm) * after.s;
+                                                    if (!(glm::length(after_palm - left_grip->position) < kGrabLetGo)) {
+                                                        g_support_grab.let_go = true;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         support          = Compose(weapon_xf, support_in_weapon);
                                         g_support.held   = true;
                                         support_on_gun   = true;
@@ -4252,7 +4915,18 @@ namespace body
                                             g_barrel.aim_forward = glm::normalize(weapon_xf.r * g_basis.forward);
                                         }
                                     }
+                                    if (two_handed) {
+                                        ++g_grip_lock.two_handed_frames;
+                                    } else if (held) {
+                                        ++g_grip_lock.near_frames;
+                                    }
+                                    if (!steered) {
+                                        g_stock_filter.ok = false; // (fix198: the stock's filter starts over at the next two-handed hold)
+                                    }
                                 }
+                            }
+                            if (lock_grip) {
+                                GripLockLog(); // (fix195)
                             }
 
                             g_barrel.placed        = true;
@@ -4446,6 +5120,22 @@ namespace body
             g_body_muzzle_frame.store(vr->m_engine_frame_count.load(), std::memory_order_release); // (after the node: FreshMuzzle)
         }
 
+        // Where the body's neck is put behind your eyes (flat, metres; seated and standing alike).
+        // - kNeckBehindEyes: along where your head looks (since fix159). It is also the radius your eyes turn about the neck by when
+        //   only your head turns, taken off your lean in PrepareFrame.
+        // - (fix195) kBodyBackLevel, kBodyBackLookDown: the whole body moved further back along its own forward, 0.05 m, and 0.03 m more
+        //   times how far you look down (0 looking level or up, 1 straight down). Looking level along the body the neck is then 0.17 m
+        //   behind the eyes, looking straight down 0.20 m. The third-person model's neck sat too far forward: looking down, the chest and
+        //   legs were under or ahead of the eyes. The values follow Homard's Starfield VR body (the neck 0.09 m behind the eyes plus its
+        //   body slider's 0.075 m back, and 0.03 m more times how far the player looks down: 0.165 m looking level) and FRIK in Fallout 4 VR (the
+        //   body 3 game units back, seated and standing, and moved back further as you look down).
+        //   The extra is along the body's forward, not your look (as both of those do), so turning only your head does not swing the
+        //   body round: along your look, 0.17 m would put your eyes over a shoulder with the head turned to the side (fix159's cloak in
+        //   front of the eye) and a head turn alone would bend the spine sideways by several centimetres.
+        constexpr float kNeckBehindEyes   = 0.12f;
+        constexpr float kBodyBackLevel    = 0.05f;
+        constexpr float kBodyBackLookDown = 0.03f;
+
         // Before the engine turns the pose locals into worlds: place the body under the head and pose it.
         // Returns true when the shifted root should be used. Game memory is read here, so it runs under
         // PrepareFrameGuarded.
@@ -4474,9 +5164,8 @@ namespace body
                     // Both transforms are final from the previous frame here.
                     MeasureBarrel();
 
-                    // Body placed so the neck is under and behind the eyes (horizontal only). Your own lean is taken by the
-                    // spine (up to kLeanReach); the rest moves the body.
-                    constexpr float kNeckBehindEyes = 0.12f;
+                    // Body placed so the neck is under and behind the eyes (horizontal only; kNeckBehindEyes and, fix195,
+                    // kBodyBackLevel/kBodyBackLookDown above). Your own lean is taken by the spine (up to kLeanReach); the rest moves the body.
                     constexpr float kLeanReach      = 0.20f;
                     shifted_root                    = *root_local;
                     g_lean                          = glm::vec3{ 0.0f };
@@ -4586,8 +5275,21 @@ namespace body
                                 room_ahead.z = 0.0f;
                                 room_ahead   = glm::length(room_ahead) > 1e-3f ? glm::normalize(room_ahead) : glm::vec3{ 0.0f };
                             }
+                            // (fix195) How far you look down: the downward share of where the headset looks, against the room's own up
+                            // (stage space: the game's view tilt does not count), 0 looking level or up, 1 straight down. It is 0 on
+                            // both sides of level, so the body does not jump as your head's pitch crosses it. The body goes back
+                            // kBodyBackLevel, and kBodyBackLookDown more times this, along its own forward.
+                            float look_down = 0.0f;
+                            {
+                                const glm::vec3 ahead = -glm::vec3{ tracking::HeadPose()[2] };
+                                const float     n     = glm::length(ahead);
+                                if (n > 1e-3f && std::isfinite(n)) {
+                                    look_down = std::clamp(-ahead.y / n, 0.0f, 1.0f);
+                                }
+                            }
+                            const float body_back = kBodyBackLevel + kBodyBackLookDown * look_down;
                             const auto neck    = pose.GameWorld(g_bones.neck).t;
-                            auto       delta   = eye - behind * kNeckBehindEyes - neck;
+                            auto       delta   = eye - behind * kNeckBehindEyes - forward * body_back - neck;
                             delta.z            = 0.0f;
                             const float length = glm::length(delta);
                             // (fix143) Your head's own lean: where it is against where you recentred, flat, in the game's world (as the hands
@@ -4603,7 +5305,8 @@ namespace body
                                 real_lean.z = 0.0f;
                                 // (fix159) At the neck, not the eyes: a head turned alone moves the eyes round the neck (9 cm at 60 deg), which is no
                                 // lean (with the neck now behind the eyes along the look, that arc slid the hips; the review). Recentred, you look
-                                // along the room's forward.
+                                // along the room's forward. (fix195: only the part along your look turns with your head; the body's extra
+                                // back, along its own forward, is no lean and stays out of this: it moves the whole body, not the spine.)
                                 if (glm::length(room_ahead) > 0.5f) {
                                     real_lean -= (behind - room_ahead) * kNeckBehindEyes;
                                     real_lean.z = 0.0f;
@@ -5274,7 +5977,8 @@ namespace body
             }
             // (fix151) On a ladder (the body's own work off): the head bone scaled to nothing for this update, as first person's IK does, and
             // put back after it (the update has made its worlds, skin and geometry by then; the animation's scale stays the animation's).
-            const bool ladder     = !pose.local && LadderClimb::HeadWanted();
+            // (fix199) Seated with the view at the seated body's eyes, the game's camera not under the head bone (SeatView): the same.
+            const bool ladder     = !pose.local && (LadderClimb::HeadWanted() || SeatView::HeadScaleWanted());
             float*     head_scale = ladder ? LadderHeadScale(model) : nullptr;
             const float head_was  = head_scale != nullptr ? *head_scale : 1.0f;
             if (head_scale != nullptr) {
@@ -5288,7 +5992,8 @@ namespace body
             }
 
             // (fix148) On a ladder (the body's own work off: the game's third person), the head bone's place as this update put it.
-            if (ladder) {
+            // (fix199) Seated with the game's own body shown, while SeatView measures its eyes: the same (its scale left alone then).
+            if (ladder || (!pose.local && SeatView::HeadWanted())) {
                 NoteLadderHeadGuarded(model);
             }
             if (pose.local && !g_ik_failed.load() && !AfterFrameGuarded(&pose)) {
@@ -5411,6 +6116,16 @@ namespace body
         g_model_update_hook = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&ModelNodeUpdateTransforms));
         g_hook_ready        = static_cast<bool>(g_model_update_hook);
         spdlog::info("[BodyIK] model node hook: {}", g_hook_ready.load());
+        // (fix195) The body's place behind your eyes, once a start.
+        static bool placement_told = false;
+        if (!placement_told) {
+            placement_told = true;
+            spdlog::info("[BodyIK] (fix195) the body's neck behind your eyes: {:.2f} m along your look, the body {:.2f} m further back along its "
+                         "forward ({:.2f} m in all looking level along the body) and {:.2f} m more times how far you look down ({:.2f} m looking "
+                         "straight down); seated and standing alike",
+                kNeckBehindEyes, kBodyBackLevel, kNeckBehindEyes + kBodyBackLevel, kBodyBackLookDown,
+                kNeckBehindEyes + kBodyBackLevel + kBodyBackLookDown);
+        }
     }
 
     bool IsActive()
@@ -5428,6 +6143,27 @@ namespace body
         head[0] = h.at.x;
         head[1] = h.at.y;
         head[2] = h.at.z;
+        return true;
+    }
+
+    bool SeatCameraUnderHead(bool& under)
+    {
+        // (fix199) The first-person camera's nodes (FirstPersonState +0xA0, the camera; +0xA8 and +0xB0, the two the game finds by name
+        // beside it), seated pointing into the shown body: is any of them under its head bone? Then shrinking the head would move the view.
+        RE::NiAVObject* head = g_ladder_head.node;
+        RE::NiAVObject* nodes[3]{};
+        if (auto pc = CreationEngineSingletonManager::GetPlayerCameraSingleton(); pc && pc->pFirstPersonModeState) {
+            nodes[0] = pc->pFirstPersonModeState->cameraRoot;
+            nodes[1] = pc->pFirstPersonModeState->pNiNode;
+            nodes[2] = pc->pFirstPersonModeState->pNiNode2;
+        }
+        if (head == nullptr || nodes[0] == nullptr) {
+            return false;
+        }
+        under = false;
+        for (auto* node : nodes) {
+            under = under || (node != nullptr && IsAncestorGuarded(node, head));
+        }
         return true;
     }
 
@@ -5638,6 +6374,11 @@ namespace body
     void NotifyPlayerFired()
     {
         g_fire_sample = true;
+    }
+
+    bool GunHeldWithBothHands()
+    {
+        return g_state.active && g_gun_both_hands.load(std::memory_order_relaxed);
     }
 
     bool IsSupportHandOnGun()

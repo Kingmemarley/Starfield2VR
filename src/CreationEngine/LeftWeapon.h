@@ -61,6 +61,8 @@ namespace LeftWeapon
     bool AttackInstance(uintptr_t& form, uintptr_t& instance);
     // A form by its id (the game's TESForm::LookupByID, checked at Install; 0: none, or not checked). Main thread.
     uintptr_t LookupForm(uint32_t id);
+    // "Y" below is the reload button, the one that sends the game's X (fix194: Touch X with the face buttons as printed, Touch Y in the
+    // old layout); the names are the old layout's.
     // (fix157) Two quick presses of Y (ModConfig): the left hand's weapon put away, or drawn again (any thread). Your weapons put away by
     // the game (Y held) draw both again.
     void ToggleSheathed();

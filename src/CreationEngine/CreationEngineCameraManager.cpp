@@ -17,6 +17,7 @@
 #include "ConversationPanel.h"
 #include "BuildConsole.h"
 #include "MessagesBlock.h"
+#include "SeatView.h"
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/models/GameFlow.h>
 #include <CreationEngine/models/ModSettingsStore.h>
@@ -236,6 +237,9 @@ void CreationEngineCameraManager::onNiAVObjectUpdateWorld(RE::NiAVObject *obj, R
     // (fix185) While climbing, the first-person camera's root put at your character's place as asked this frame plus your eyes' height
     // (after the ladder's: never both, Climbing ties nothing on a ladder; one pointer compared for every other node).
     Climbing::BeforeNodeUpdate(obj);
+    // (fix195) On foot in first person, the camera root put where the body (and the gun in its hand) was placed this frame ("Tie the
+    // view to the body"; after Climbing's, which it leaves alone; one pointer compared for every other node).
+    tracking::BeforeNodeUpdate(obj);
     // (fix148) The camera root's place, as the game has just worked it out, noted with your character's (after the game's update, on
     // every way out below: the body is put ahead by your move since).
     struct AfterUpdate {
@@ -1221,6 +1225,12 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         worldCamera->local.rotate = originalRotation;
         worldCamera->local.translate = originalPosition;
         WatchCameraBehindMenu(worldCamera, false);
+        // (fix199) The seat view off only for good reasons (no headset, the flat screen, head tracking off, camera shake): a menu on its
+        // panel (the star map from the pilot's seat) leaves it as it is.
+        if (!vr->is_hmd_active() || ModConstants::cameraShake || ModSettings::g_internalSettings.forceFlatScreen ||
+            ModSettings::g_debug.disableHeadTracking) {
+            SeatView::Off();
+        }
         std::scoped_lock _{g_head_local_mtx};
         g_head_local_valid = false;
         return;
@@ -1265,6 +1275,13 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
             const float parent_scale = parent_world.scale != 0.0f ? parent_world.scale : 1.0f;
             crouch_local = glm::transpose(NiMath::to_glm(parent_world.rotate)) * glm::vec3{0.0f, 0.0f, crouch} / parent_scale;
         }
+        // (fix199) Just up from a seat: the view's move to the seated body's eyes eased out here too (SeatView; zero once off; the hands
+        // take the same move, tracking::StageToWorld).
+        if (const glm::vec3 seat_shift = SeatView::EaseOut(); seat_shift != glm::vec3{0.0f} && worldCamera->parent != nullptr) {
+            const auto& parent_world = worldCamera->parent->world;
+            const float parent_scale = parent_world.scale != 0.0f ? parent_world.scale : 1.0f;
+            crouch_local += glm::transpose(NiMath::to_glm(parent_world.rotate)) * seat_shift / parent_scale;
+        }
         {
             std::scoped_lock _{g_head_local_mtx};
             g_head_local = glm::vec3(head_only[3]) + crouch_local;
@@ -1303,6 +1320,11 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         head_rotation[3].x -= standing_origin[3].x;
         head_rotation[3].y -= standing_origin[3].y;
         head_rotation[3].z -= standing_origin[3].z;
+        // (fix199) Seated with the game's own body shown: your head's lean from where it was as you sat held softly (to about 30 cm),
+        // and the view moved from the game's seat camera to that body's eyes (in the camera's parent's axes, added below). Zero otherwise.
+        glm::vec3 seat_head{head_rotation[3]};
+        const glm::vec3 seat_offset = SeatView::Update(worldCamera, seat_head, glm::vec3{standing_origin[3]});
+        head_rotation[3] = Vector4f{seat_head, 1.0f};
         auto eye = get_camera_eye_transform();
         // (Full stereo: the right eye's distance from the left, as in first person.)
         if (vr->is_native()) {
@@ -1312,6 +1334,9 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         }
         head_rotation = head_rotation * eye;
         head_rotation = to_havok_space(head_rotation);
+        head_rotation[3][0] += seat_offset.x; // (fix199)
+        head_rotation[3][1] += seat_offset.y;
+        head_rotation[3][2] += seat_offset.z;
         head_for_menu = head_rotation;
         worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3 *) &head_rotation;
         worldCamera->local.translate.x = head_rotation[3][0];
@@ -1396,9 +1421,11 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
 
         // Snap turn queued by the right stick: turn the character (its heading, clockwise from above).
         // The camera follows from the next frame on.
+        float snap_applied = 0.0f; // (fix195: left out of the heading the room is worked out from below; it shows from the next frame)
         if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f && p_player) {
             const float two_pi = 2.0f * glm::pi<float>();
             p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);
+            snap_applied           = snap;
             g_snap_show_frames     = 3; // (frames: counted once a frame)
             static int logged = 0;
             if (logged < 5) {
@@ -1625,9 +1652,42 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
                 p_player->data.angle.x = 0.0f;
                 pitch                  = 0.0f;
             }
+            // (fix195) Measured only: does the game ever roll its camera here (a stagger, a hit, sprinting)? The room, and with it the
+            // view and the hands, would then roll too. Counted in first person on foot, told every 10 s while it happens (20 times).
+            {
+                static int     rolled = 0, frames = 0, roll_logs = 0;
+                static float   roll_max = 0.0f;
+                static int64_t roll_at  = 0;
+                const int64_t  roll_now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (GameFlow::isInFirstPerson() && !menu_open) {
+                    ++frames;
+                    if (std::abs(roll) > glm::radians(0.5f) && std::isfinite(roll)) {
+                        ++rolled;
+                        roll_max = std::max(roll_max, std::abs(roll));
+                    }
+                }
+                if (roll_now - roll_at > 10'000) {
+                    if (rolled > 0 && roll_logs < 20) {
+                        ++roll_logs;
+                        spdlog::info("[LevelView] (fix195) the game's camera was rolled (over 0.5 degrees) in {} of {} frames in first person, at "
+                                     "most {:.1f} degrees, the last 10 s: the room (the view and the hands) rolled with it",
+                            rolled, frames, glm::degrees(roll_max));
+                    }
+                    rolled = frames = 0;
+                    roll_max        = 0.0f;
+                    roll_at         = roll_now;
+                }
+            }
             havok_rotation.FromEulerAnglesXYZ(pitch, roll, yaw);
             const auto room_rotation = RE::NiQuaternion(havok_rotation);
             tracking::SetRoomRotation(room_rotation);
+            // (fix195) The heading the room was just worked out from (the snap turn above shows from the next frame): the body's hands are
+            // placed before this hook next frame, with this room turned on by your heading's change since (tracking::RoomRotationNow).
+            // (Not carried on in a conversation, where the game's heading change is held back into the yaw offset (fix163, fix173) so the room
+            // does not turn with the heading, nor after a snap turn, which shows from the next frame as before; the reviews.)
+            if (p_player != nullptr) {
+                tracking::NoteRoomHeading(p_player->data.angle.z - snap_applied, snap_applied == 0.0f && !GameFlow::isDialogueDrawnNow());
+            }
             *quat_out = room_rotation * ni_aim_rotation;
             tracking::RecordAppliedAim(aim_rotation, (int)vr->m_engine_frame_count.load());
             if (vr->tracing()) {

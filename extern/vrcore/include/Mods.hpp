@@ -23,6 +23,9 @@ public:
     void on_pre_imgui_frame() const;
     void on_draw_ui() const;
     void on_draw_quick_ui() const;
+    void on_draw_main_ui(int part) const;  // (fix196)
+    void on_draw_advanced_ui(int part) const; // (fix196)
+    void on_draw_debug_ui() const;         // (fix196)
     void on_device_reset() const;
     bool on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) const;
 

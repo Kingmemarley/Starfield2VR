@@ -28,6 +28,7 @@
 #include "Physical.h"
 #include "TempleGestures.h"
 #include "WheelPicture.h"
+#include "body/BodyIK.h"
 #include "memory/GameCode.h"
 #include "memory/ScanHelper.h"
 #include "models/GameFlow.h"
@@ -745,6 +746,9 @@ namespace FavoritesWheel
             }
             if (MeleeThrow::Away(true)) {
                 return "your left hand's weapon is thrown";
+            }
+            if (body::GunHeldWithBothHands()) {
+                return "your left hand holds the gun (both hands, its grip)"; // (fix198)
             }
             if (HandGrab::GloveMark mark{}; HandGrab::AimMark(mark) && mark.hand == 0 && (mark.kind == 1 || mark.kind == 2)) {
                 return "the gravity gloves have something in sight";

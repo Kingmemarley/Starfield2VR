@@ -52,7 +52,7 @@ cmake --build --preset release-no-debug-msvc
 `shipping/openvr_api.dll` is not part of a release. The mod uses OpenXR. Its OpenVR path is untested, and it has no default
 SteamVR bindings.
 
-Players also need the ViGEmBus driver (see [README.md](README.md)). It is not bundled.
+Players do not need the ViGEmBus driver: the mod gives the game its own virtual controller and uses ViGEmBus only as a fallback, when it is installed (see [README.md](README.md)). It is not bundled.
 
 ## When something goes wrong
 

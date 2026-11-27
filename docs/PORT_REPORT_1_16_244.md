@@ -1,6 +1,6 @@
 # Port report: Starfield 1.16.236.0 -> 1.16.244.0
 
-449 of 449 places ported. Calls not understood: 0. Checked runs not as in 1.16.236.0: 0.
+450 of 450 places ported. Calls not understood: 0. Checked runs not as in 1.16.236.0: 0.
 
 ## Not converted to GameCode yet (2; in this build their features read 1.16.236's places)
 - CreationEngine\CreationEngineWeaponModule.cpp:10: 'MemoryScan::mod + 0x37de714': the game's base added to a place by hand (not converted yet)
@@ -222,7 +222,7 @@
 - 0x308b8c0 -> 0x3087bc0: the one function alike (one of its kind in both), 0x0 in
 - 0x4cc19a0 -> 0x4cbef20: slot 0 of the type table of .?AV?$LocalFunctionImpl@V<lambda_09861f9863174d1d28bdf7929e559315>@@W4BSVisitControl@BSVisit@@AEAVNiAVObject@@@local_function_detail@stl@@: the one table of that type in each exe (0x4cc19a0, 0x4cbef20), 3 slots in both; the other rules agree
 - 0x4d67ac0 -> 0x4d636b0: slot 0 of the type table of .?AVbhkNPCollisionProxyObject@@: the one table of that type in each exe (0x4d67ac0, 0x4d636b0), 60 slots in both, holding 0x237aee0, the port of 0x237d510 (matched for certain); the other rules agree
-- 0x61e7488 -> 0x61df6e8: referred to at 0xb05b80+0x71 (the one function alike (one of its kind in both)); 6 more reference(s) to it agree
+- 0x61e7488 -> 0x61df6e8: referred to at 0xb05b80+0x71 (the one function alike (one of its kind in both)); 7 more reference(s) to it agree
 
 ## CreationEngine\ImpactMelee.cpp: 10 of 10
 - 0x19813d0 -> 0x197eb20: the one function alike (one of its kind in both), 0x0 in
@@ -246,7 +246,7 @@
 - 0x1e9c5c0 -> 0x1e99b20: (no unwind entry: code 0x1e9c5c0-0x1e9c5cd between int3 paddings) the one function alike (one of its kind in both), 0x0 in
 - 0x1e9c5d0 -> 0x1e99b30: (no unwind entry: code 0x1e9c5d0-0x1e9c5e6 between int3 paddings) the one function alike (one of its kind in both), 0x0 in
 - 0x4d09bb8 -> 0x4d05bc8: slot 0 of the type table of .?AVThirdPersonState@@: the one table of that type in each exe (0x4d09bb8, 0x4d05bc8), 26 slots in both; the other rules agree
-- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 10 more reference(s) to it agree
+- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 11 more reference(s) to it agree
 
 ## CreationEngine\LeftWeapon.cpp: 40 of 40
 - 0x2c5e90 -> 0x2c5870: the one function alike (one of its kind in both), 0x0 in
@@ -304,6 +304,9 @@
 - 0x840b67 -> 0x8402d7: the one function alike (one of its kind in both), 0x157 in
 - 0x840b6c -> 0x8402dc: the one function alike (one of its kind in both), 0x15c in
 - 0x840dc7 -> 0x840537: the one function alike (one of its kind in both), 0x3b7 in
+
+## CreationEngine\MuzzleFire.cpp: 1 of 1
+- 0x1b0a2ba -> 0x1b0797a: the one function alike (one of its kind in both), 0x81a in
 
 ## CreationEngine\Physical.cpp: 64 of 64
 - 0x2b4ec0 -> 0x2b4b60: the one function alike (one of its kind in both), 0x0 in
@@ -369,7 +372,7 @@
 - 0x5f4e548 -> 0x5f467a8: referred to at 0x1c5ee0+0xe (1110 functions alike, none clearly the one by its body; by its place: number 3 of the 215 functions between 0x1c5e50 and 0x1c9100 (each matched for certain), all alike and as many in both; its references fit it (4) and not its 19 twin(s) between them)
 - 0x5fb7bf0 -> 0x5fafe70: referred to at 0x19038a0+0x292 (the one function alike (one of its kind in both)); 11 more reference(s) to it agree
 - 0x5fe1908 -> 0x5fd9b88: referred to at 0xb48040+0x25b (the one function alike (one of its kind in both)); 1 more reference(s) to it agree
-- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 10 more reference(s) to it agree
+- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 11 more reference(s) to it agree
 
 ## CreationEngine\PhysicsProbe.cpp: 42 of 42
 - 0x50b8d0 -> 0x50b150: the one function alike (one of its kind in both), 0x0 in
@@ -523,7 +526,7 @@
 ## CreationEngine\WorkbenchCamera.cpp: 3 of 3
 - 0x1e91d83 -> 0x1e8f2e3: the one function alike (one of its kind in both), 0xa3 in
 - 0x1e91fe7 -> 0x1e8f547: the one function alike (one of its kind in both), 0x307 in
-- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 10 more reference(s) to it agree
+- 0x61e51f0 -> 0x61dd460: referred to at 0xb48040+0x4ab (the one function alike (one of its kind in both)); 11 more reference(s) to it agree
 
 ## CreationEngine\body\BodyIK.cpp: 4 of 4
 - 0x1a41d50 -> 0x1a3f340: the one function alike (one of its kind in both), 0x0 in

@@ -11,8 +11,13 @@ std::shared_ptr<VRConfig>& VRConfig::get() {
     return inst;
 }
 
-void VRConfig::on_draw_ui() {
-    if (!ImGui::CollapsingHeader("Menus and Virtual Screen")) {
+// (fix196) The F11 menu's Advanced tab: the game menus' panel and the virtual screen (the pointer's status lines and Troubleshooting are in
+// Debug: on_draw_debug_ui).
+void VRConfig::on_draw_advanced_ui(int part) {
+    if (part != 2) {
+        return;
+    }
+    if (!menu_ui::group("Game menus' panel and the virtual screen")) {
         return;
     }
 
@@ -23,7 +28,7 @@ void VRConfig::on_draw_ui() {
     m_panel_enabled->draw("Menus on the panel (off: the old screen that moves with your head)");
     if (m_panel_enabled->value()) {
         m_panel_curved->draw("Curved around you");
-        m_vd_fix->draw("Virtual Desktop fix (an empty layer with your head position first)");
+        m_vd_fix->draw("Virtual Desktop fix (behind menus and on the flat screen: an empty layer with your head position first)");
         m_panel_draw_in->draw("Draw the menu into the world picture (keeps it in place with Virtual Desktop)");
         m_panel_pointer_laser->draw("The pointer's laser in every menu (as at the main menu)");
         m_panel_distance->draw("Panel distance (m)");
@@ -79,20 +84,26 @@ void VRConfig::on_draw_ui() {
                 ImGui::TextDisabled("The runtime refused the soft light around the panel: it is off until the game restarts.");
             }
         }
-        if (s_pointer_status) {
-            ImGui::TextWrapped("%s", s_pointer_status().c_str());
-        }
     }
 
     ImGui::SeparatorText("Virtual screen");
-    ImGui::TextWrapped("Flat-screen mode (left grip + left stick click) is shown on this screen%s.",
+    ImGui::TextWrapped("Flat-screen mode (left grip + left stick click, or F12) is shown on this screen%s.",
         m_panel_enabled->value() ? "" : ", and so are menus");
     m_flat_screen_distance->draw("Distance (m)");
     m_flat_screen_width->draw("Width (m)");
+}
 
-    ImGui::Separator();
+// (fix196) The Debug tab: the menu pointer's and the menus' status lines, and Troubleshooting.
+void VRConfig::on_draw_debug_ui() {
+    if (menu_ui::group("Menus: status")) {
+        if (s_pointer_status) {
+            ImGui::TextWrapped("%s", s_pointer_status().c_str());
+        } else {
+            ImGui::TextDisabled("No status yet.");
+        }
+    }
 
-    if (ImGui::TreeNode("Troubleshooting")) {
+    if (menu_ui::group("Troubleshooting")) {
         ImGui::TextWrapped("Each switch turns off one of the mod's changes to the game camera. "
                            "If the picture is black, try them one at a time.");
         auto& d = ModSettings::g_debug;
@@ -113,7 +124,6 @@ void VRConfig::on_draw_ui() {
         ImGui::Checkbox("Reset TAA history every frame", &d.taaHistoryReset);
         ImGui::Checkbox("Use the other TAA history slot", &d.taaHistoryInvert);
         ImGui::TextDisabled("Turn these on only after the save has loaded; they reset when the game restarts.");
-        ImGui::TreePop();
     }
 }
 

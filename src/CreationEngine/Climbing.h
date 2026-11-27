@@ -28,7 +28,8 @@ namespace RE
 //   controller's speed and its fall height each time), its heading kept as it is when it runs. The controller's gravity factor is set to 0
 //   while you hold on (the game's own zero-gravity case: it then keeps the fall height at where you are), and put back as you let go.
 // - Letting go of every grip is a plain fall: the game's own gravity and fall damage, counted from where you let go.
-// - While a hand holds you on, the right trigger and A (jump, the boost pack) are held back from the game until let go (ModConfig).
+// - While a hand holds you on, the right trigger and the game's A (use; fix194: this said jump before, but Starfield's jump is Y, which
+//   is not held back) are held back from the game until let go (ModConfig).
 // - Off (and you let go) in menus, conversations, build mode, the scanner and the star map, the favorites, on a ladder, in a seat or the
 //   pilot's seat, in third person, on the flat screen, with a weapon in your hands, while something or someone is held, dead, or after a
 //   jump of over 2 m (a load, a teleport).

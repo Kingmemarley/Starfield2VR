@@ -64,6 +64,31 @@ void Mods::on_draw_quick_ui() const {
     }
 }
 
+// (fix196) The F11 menu's tabs (Mod::on_draw_main_ui and the others), each mod's rows in the mods' order.
+void Mods::on_draw_main_ui(int part) const {
+    for (auto& mod : m_mods) {
+        ImGui::PushID(mod.get());
+        mod->on_draw_main_ui(part);
+        ImGui::PopID();
+    }
+}
+
+void Mods::on_draw_advanced_ui(int part) const {
+    for (auto& mod : m_mods) {
+        ImGui::PushID(mod.get());
+        mod->on_draw_advanced_ui(part);
+        ImGui::PopID();
+    }
+}
+
+void Mods::on_draw_debug_ui() const {
+    for (auto& mod : m_mods) {
+        ImGui::PushID(mod.get());
+        mod->on_draw_debug_ui();
+        ImGui::PopID();
+    }
+}
+
 void Mods::on_device_reset() const {
     for (auto& mod : m_mods) {
         mod->on_device_reset();

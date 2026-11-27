@@ -874,6 +874,10 @@ namespace GameFlow {
     bool isScannerDrawnWithin(int withinMs) {
         return now_ms() - g_last_scanner_ms.load() < withinMs;
     }
+
+    bool isFullscreenMenuDrawnWithin(int withinMs) {
+        return now_ms() - g_fullscreen_last_ms.load() < withinMs; // (fix194)
+    }
 }
 
 namespace GameFlow {

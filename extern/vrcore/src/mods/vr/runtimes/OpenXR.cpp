@@ -620,6 +620,7 @@ void OpenXR::destroy() {
     this->panel_image_height = 0;
     this->panel_image_ready = false;
     this->frozen_ready = false;
+    this->frozen_left_out = false; // (fix200)
     this->live_world_ready = false;
     // (fix164) And the soft light's.
     this->ambient_swapchain = XR_NULL_HANDLE;
@@ -1976,6 +1977,54 @@ bool OpenXR::update_panel_placement() {
     return true;
 }
 
+// (fix196) The mod's own menu (F11) put in front of you as it opens (the framework counts each opening, and its "Centre this menu"
+// button, in fw_menu_place_serial), and for half a second after a recenter (as the panel); it then stays where it was put.
+bool OpenXR::place_fw_menu() {
+    constexpr XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    const auto now = std::chrono::steady_clock::now();
+    if (this->fw_menu_recenter.exchange(false)) {
+        this->fw_menu_replace_until = now + std::chrono::milliseconds(500);
+    }
+    const uint32_t serial = this->fw_menu_place_serial.load();
+    // (Not shown for 2 s: closed meanwhile, as far as the panel knows. A frame missed now and then, its picture not copied in time, does
+    // not move it.)
+    if (this->fw_menu_last_shown == std::chrono::steady_clock::time_point{} || now - this->fw_menu_last_shown > std::chrono::seconds(2)) {
+        this->fw_menu_placed = false;
+    }
+    const bool replace = !this->fw_menu_placed || serial != this->fw_menu_placed_serial || now < this->fw_menu_replace_until;
+    if (!replace) {
+        return true;
+    }
+    if ((this->view_space_location.locationFlags & valid) != valid) {
+        return this->fw_menu_placed; // (no head pose this frame: it stays where it is, or waits for one)
+    }
+    const auto& pose = this->view_space_location.pose;
+    const glm::quat rotation{pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z};
+    const glm::vec3 forward = rotation * glm::vec3{0.0f, 0.0f, -1.0f};
+    glm::vec2 level{forward.x, forward.z};
+    if (glm::length(level) < 0.2f) {
+        // (Looking nearly straight down or up: the way the top of the head points, as for the panel.)
+        const glm::vec3 up = rotation * glm::vec3{0.0f, 1.0f, 0.0f};
+        level = glm::vec2{up.x, up.z} * (forward.y < 0.0f ? 1.0f : -1.0f);
+    }
+    if (glm::length(level) < 1e-3f || !std::isfinite(level.x) || !std::isfinite(level.y)) {
+        return this->fw_menu_placed;
+    }
+    // (The heading: 0 facing -Z; a turn by it about +Y faces (-sin, 0, -cos), as the panel's.)
+    this->fw_menu_yaw = std::atan2(-level.x, -level.y);
+    this->fw_menu_head[0] = pose.position.x;
+    this->fw_menu_head[1] = pose.position.y;
+    this->fw_menu_head[2] = pose.position.z;
+    if (this->fw_menu_place_logs++ < 20) {
+        spdlog::info("[VR] (fix196) The mod's menu put in front of you ({}): facing {:.0f} deg, your head at {:.2f} {:.2f} {:.2f}",
+            !this->fw_menu_placed ? "it opened" : (serial != this->fw_menu_placed_serial ? "asked for" : "after a recenter"),
+            glm::degrees(this->fw_menu_yaw), pose.position.x, pose.position.y, pose.position.z);
+    }
+    this->fw_menu_placed = true;
+    this->fw_menu_placed_serial = serial;
+    return true;
+}
+
 bool OpenXR::menu_draw_params(int eye, bool mono, float params[16], float panel[4], float dot[4]) {
     constexpr XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
     constexpr float pi = 3.14159265f;
@@ -2156,6 +2205,10 @@ XrResult OpenXR::end_frame() {
     const bool panel_image_only = render && !panel_ready && this->panel_mode && this->panel_image_ready && this->panel_swapchain != XR_NULL_HANDLE &&
                                   this->panel_image_width > 0 && this->panel_image_height > 0;
     const bool has_picture = panel_ready || (render && this->flat_screen_mode && (last_image_ready || panel_image_only)) || (render && both_images_ready);
+    // (fix196) The mod's own menu (F11) on its own panel this frame (its image filled this frame). While it is, the game menu panel's beam and
+    // dot are not drawn (the controllers point at the mod's menu; the game gets no input meanwhile).
+    const bool fw_menu_shown = render && this->fw_menu_image_ready && !this->fw_menu_refused.load() && this->fw_menu_swapchain != XR_NULL_HANDLE &&
+                               this->fw_menu_image_width > 0 && this->fw_menu_image_height > 0;
 
     // The strip's pictures (the gun sight, the panel's veil, beam and dot). A frame the runtime refused with them in it: the
     // next few go without them (see below).
@@ -2189,6 +2242,10 @@ XrResult OpenXR::end_frame() {
 
     int panel_kind = 0; // the panel submitted: 1 flat, 2 curved
     bool world_submitted = false;
+    // (fix200) Behind a menu's panel: which world is behind it (0 none, 1 the world as it is now, 2 the world as it was), and whether the
+    // world as it is now is the frame's first layer, the menu not drawn into it (then it carries this frame's kept poses, as in play).
+    int menu_world = 0;
+    bool live_world_first = false;
     PanelPointer pointer{};
 
     // The eye images as in play: each seen from where its eye is now (mono: the head's pose for both, which then see the same
@@ -2329,6 +2386,9 @@ XrResult OpenXR::end_frame() {
             // the menu is never shown twice in an eye.)
             menu_drawn_in = this->panel_draw_in.load() && (drawn_now[0].valid || drawn_now[1].valid);
             add_world_views(menu_drawn_in ? drawn_now : nullptr);
+            menu_world = 1;
+            live_world_first = !menu_drawn_in && projection_layer_views.size() == 2 && !layers.empty() &&
+                               layers.front() == (XrCompositionLayerBaseHeader*)&layer;
             if (menu_drawn_in) {
                 ++this->stat_drawn_frames;
                 if (!this->drawn_logged) {
@@ -2361,6 +2421,7 @@ XrResult OpenXR::end_frame() {
             layer.viewCount = 2;
             layer.views = projection_layer_views.data();
             layers.push_back((XrCompositionLayerBaseHeader*)&layer);
+            menu_world = 2;
             ++this->stat_frozen_frames;
 
             // Dimmed by a veil kept in front of your eyes, under the panel (the strip's even black, partly see-through). Not behind a
@@ -2508,7 +2569,8 @@ XrResult OpenXR::end_frame() {
         // The pointing hand's beam to where it meets the panel and a dot there; with neither meeting it, a short beam from the
         // preferred hand (so you can see you can point).
         const int beam_hand = pointer.hand >= 0 ? pointer.hand : preferred;
-        if (strip_usable && this->panel_pointer_enabled.load() && has_ray[beam_hand] && (this->view_space_location.locationFlags & valid) == valid) {
+        if (strip_usable && !fw_menu_shown && this->panel_pointer_enabled.load() && has_ray[beam_hand] &&
+            (this->view_space_location.locationFlags & valid) == valid) { // (fix196: not with the mod's own menu over it)
             const auto& head_pose = this->view_space_location.pose;
             const glm::vec3 head{head_pose.position.x, head_pose.position.y, head_pose.position.z};
             const glm::vec3 start = ray_origin[beam_hand];
@@ -3242,7 +3304,9 @@ XrResult OpenXR::end_frame() {
                                this->console_swapchain != XR_NULL_HANDLE && this->console_image_width > 0 && this->console_image_height > 0;
     int console_submitted = 0;
     if (console_shown) {
-        const size_t limit = this->max_layers > 1 ? this->max_layers - 1 : 1;
+        // (fix196: and two more kept for the mod's own menu and its beam while it is open: it goes over the console.)
+        const size_t keep = 1 + (fw_menu_shown ? 2 : 0);
+        const size_t limit = this->max_layers > keep ? this->max_layers - keep : 1;
         int left_out = 0;
         for (int i = 0; i < console_now.count && i < kConsoleQuads; ++i) {
             const auto& q = console_now.quads[i];
@@ -3285,9 +3349,141 @@ XrResult OpenXR::end_frame() {
         }
     }
 
+    // (fix196) The mod's own menu (F11) on its own panel, fixed in the room where it was put as it opened, over everything else (the game
+    // menu's panel too: then nearer than that panel, the same size in view, so it is not seen behind what it covers), in both eyes. The
+    // framework's picture of it is premultiplied (ImGui's blending over a cleared, see-through picture). Where each controller's aim meets it
+    // is given to the framework (its mouse), with a beam from the pointing hand to it (the strip's, as the panel's pointer).
+    XrCompositionLayerQuad fw_menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad fw_beam_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    bool fw_menu_submitted = false;
+    FwMenuPointer fw_pointer{};
+    if (!fw_menu_shown) {
+        this->fw_menu_recenter = false; // (a recenter while it is closed: it is put in front of you as it opens anyway)
+    } else if (this->place_fw_menu()) {
+        const float set_distance = std::clamp(this->fw_menu_distance_m.load(), 0.5f, 4.0f);
+        float distance = set_distance;
+        if (panel_ready) {
+            distance = std::min(distance, std::max(0.5f, std::clamp(this->panel_distance.load(), 0.4f, 5.0f) - 0.25f));
+        }
+        const float k = distance / set_distance; // (nearer: smaller by as much, the same size in view)
+        const float height = std::clamp(this->fw_menu_height_m.load(), 0.3f, 3.0f) * k;
+        const float width = height * (float)this->fw_menu_image_width / (float)this->fw_menu_image_height;
+        const glm::quat turn = glm::angleAxis(this->fw_menu_yaw, glm::vec3{0.0f, 1.0f, 0.0f});
+        const glm::vec3 head_at{this->fw_menu_head[0], this->fw_menu_head[1], this->fw_menu_head[2]};
+        // (Its middle a little below your eyes, as you held your head when it was put there.)
+        const glm::vec3 center = head_at + turn * glm::vec3{0.0f, -0.05f * k, -distance};
+        const size_t limit = this->max_layers > 1 ? this->max_layers - 1 : 1; // (one kept for the Virtual Desktop fix's layer)
+        const bool finite = std::isfinite(center.x) && std::isfinite(center.y) && std::isfinite(center.z) && std::isfinite(width) && width > 0.01f;
+        if (finite && layers.size() < limit) {
+            fw_menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            fw_menu_layer.space = this->stage_space;
+            fw_menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            fw_menu_layer.subImage.swapchain = this->fw_menu_swapchain;
+            fw_menu_layer.subImage.imageRect.offset = {0, 0};
+            fw_menu_layer.subImage.imageRect.extent = {this->fw_menu_image_width, this->fw_menu_image_height};
+            fw_menu_layer.subImage.imageArrayIndex = 0;
+            fw_menu_layer.pose.orientation = {turn.x, turn.y, turn.z, turn.w};
+            fw_menu_layer.pose.position = {center.x, center.y, center.z};
+            fw_menu_layer.size = {width, height};
+            layers.push_back((XrCompositionLayerBaseHeader*)&fw_menu_layer);
+            fw_menu_submitted = true;
+            this->fw_menu_last_shown = std::chrono::steady_clock::now();
+
+            // Where each controller's aim meets it (in its own frame: the quad at z = 0, facing +z, toward you).
+            fw_pointer.shown = true;
+            const glm::quat unturn = glm::inverse(turn);
+            glm::vec3 ray_origin[2]{}, ray_direction[2]{}, hit_point[2]{};
+            bool has_ray[2]{false, false};
+            for (int h = 0; h < 2; ++h) {
+                const auto& hand = this->hands[h];
+                if (hand.aim_space == XR_NULL_HANDLE || (hand.aim_location.locationFlags & valid) != valid) {
+                    continue;
+                }
+                const auto& aim = hand.aim_location.pose;
+                const glm::quat aim_rotation{aim.orientation.w, aim.orientation.x, aim.orientation.y, aim.orientation.z};
+                ray_origin[h] = glm::vec3{aim.position.x, aim.position.y, aim.position.z};
+                ray_direction[h] = glm::normalize(aim_rotation * glm::vec3{0.0f, 0.0f, -1.0f});
+                has_ray[h] = std::isfinite(ray_direction[h].x) && std::isfinite(ray_origin[h].x);
+                if (!has_ray[h]) {
+                    continue;
+                }
+                const glm::vec3 o = unturn * (ray_origin[h] - center);
+                const glm::vec3 d = unturn * ray_direction[h];
+                if (!(d.z < -1e-4f)) {
+                    continue; // (pointing away from it, or along it)
+                }
+                const float t = -o.z / d.z;
+                if (!(t > 0.0f && t < 20.0f)) {
+                    continue;
+                }
+                const glm::vec3 p = o + d * t;
+                const float u = 0.5f + p.x / width;
+                const float v = 0.5f - p.y / height;
+                if (!(u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f)) {
+                    continue;
+                }
+                fw_pointer.hit[h] = true;
+                fw_pointer.u[h] = u;
+                fw_pointer.v[h] = v;
+                hit_point[h] = center + turn * p;
+            }
+            // The beam: from the hand the framework takes as pointing (or, with that one not on it, the other one on it), to where it meets
+            // the menu; with neither on it, a short one from the right hand (so you can see you can point). ImGui's own cursor is drawn
+            // where it meets the menu (the framework's mouse), so no dot.
+            int beam_hand = this->fw_menu_hand.load();
+            if (beam_hand < 0 || beam_hand > 1 || !fw_pointer.hit[beam_hand]) {
+                beam_hand = fw_pointer.hit[1] ? 1 : (fw_pointer.hit[0] ? 0 : -1);
+            }
+            const bool on_menu = beam_hand >= 0;
+            if (!on_menu) {
+                beam_hand = has_ray[1] ? 1 : (has_ray[0] ? 0 : -1);
+            }
+            if (strip_usable && beam_hand >= 0 && has_ray[beam_hand] && layers.size() < limit && (this->view_space_location.locationFlags & valid) == valid) {
+                const auto& head_pose = this->view_space_location.pose;
+                const glm::vec3 head{head_pose.position.x, head_pose.position.y, head_pose.position.z};
+                const glm::vec3 start = ray_origin[beam_hand];
+                const glm::vec3 end = on_menu ? hit_point[beam_hand] : start + ray_direction[beam_hand] * 0.3f;
+                const float length = glm::length(end - start);
+                if (length > 0.03f && length < 20.0f) {
+                    // (Along the beam its height; turned about it to face the head as much as it can, as the panel's beam.)
+                    const glm::vec3 middle = (start + end) * 0.5f;
+                    const glm::vec3 along = (end - start) / length;
+                    glm::vec3 normal = head - middle;
+                    normal -= along * glm::dot(normal, along);
+                    if (glm::length(normal) > 1e-3f) {
+                        normal = glm::normalize(normal);
+                        const glm::vec3 side = glm::cross(along, normal);
+                        const glm::quat orientation = glm::normalize(glm::quat_cast(glm::mat3{side, along, normal}));
+                        fw_beam_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        fw_beam_layer.space = this->stage_space;
+                        fw_beam_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        strip_cell(sprite_beam, 3, 0, fw_beam_layer.subImage);
+                        fw_beam_layer.pose.orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
+                        fw_beam_layer.pose.position = {middle.x, middle.y, middle.z};
+                        fw_beam_layer.size = {0.010f, length};
+                        layers.push_back((XrCompositionLayerBaseHeader*)&fw_beam_layer);
+                        strip_submitted = true;
+                    }
+                }
+            }
+            if (this->fw_menu_logs < 6) {
+                ++this->fw_menu_logs;
+                spdlog::info("[VR] (fix196) The mod's menu shown on its own panel: its {}x{} picture {:.2f} x {:.2f} m at {:.2f} m{} ({} layers this frame)",
+                    this->fw_menu_image_width, this->fw_menu_image_height, width, height, distance,
+                    panel_ready ? " (nearer than the game menu's panel)" : "", layers.size());
+            }
+        } else if (this->fw_menu_logs < 6) {
+            ++this->fw_menu_logs;
+            spdlog::warn("[VR] (fix196) The mod's menu not shown this frame: {}", finite ? "the runtime's layer limit" : "no place for it");
+        }
+    }
+    this->fw_menu_visible = fw_menu_submitted;
+
     // Where the controllers point at the panel, for the game side (its mouse).
     {
         std::scoped_lock _{this->pointer_mtx};
+        fw_pointer.at = std::chrono::steady_clock::now(); // (fix196)
+        this->fw_menu_pointer = fw_pointer;
         pointer.frame = this->panel_pointer.frame + (pointer.shown ? 1u : 0u);
         pointer.at = std::chrono::steady_clock::now();
         this->panel_pointer = pointer;
@@ -3322,15 +3518,139 @@ XrResult OpenXR::end_frame() {
             view.subImage.imageRect.extent = {2, 2};
             view.subImage.imageArrayIndex = 0;
         }
-        vd_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-        vd_layer.space = this->stage_space;
-        vd_layer.viewCount = 2;
-        vd_layer.views = vd_views.data();
-        layers.insert(layers.begin(), (XrCompositionLayerBaseHeader*)&vd_layer);
-        strip_submitted = true;
-        if (!this->vd_fix_logged) {
-            this->vd_fix_logged = true;
-            spdlog::info("[VR] Virtual Desktop fix: an empty layer with this frame's head position is sent first ({} layers this frame)", layers.size());
+        // (fix197) In play (no game menu's panel, not the flat screen) the world's own picture is already the first layer, and when its two
+        // views carry exactly these poses (the same kept poses, eye by eye) the empty layer would only repeat its head position: it is left
+        // out then (in AER, and full stereo's frames with the left eye's last picture again, both carry the same kept poses, the older eye's
+        // too: nothing changes for the headset). Behind a menu (the world as it was, or drawn with the menu's own poses), on the flat
+        // screen, or whenever a view's pose differs (mono without kept poses: the world from the head's middle), it is sent first as
+        // before. (An OpenXR layer such as VectorXR's Frame Generation makes new frames from the first projection layer only: with the
+        // empty layer first it would make them from that, and repeat the world.) (fix200: behind a menu, the world as it is now first with
+        // these poses leaves it out too; and with VectorXR's Frame Generation it never goes before the world's picture: below.)
+        // (The poses are copied: the comparison and the logs below need no lock.)
+        pose_lock.unlock();
+        // (Alike: within 1 mm, and the turns within about 0.05 degrees, compared by their difference (q and -q are one turn); a dot product
+        // of two equal quaternions can come out under 1 in float, the review: every case that should match compares the same variables.)
+        const auto same_pose = [](const XrPosef& a, const XrPosef& b) {
+            const float dx = a.position.x - b.position.x, dy = a.position.y - b.position.y, dz = a.position.z - b.position.z;
+            const float mx = a.orientation.x - b.orientation.x, my = a.orientation.y - b.orientation.y, mz = a.orientation.z - b.orientation.z,
+                        mw = a.orientation.w - b.orientation.w;
+            const float px = a.orientation.x + b.orientation.x, py = a.orientation.y + b.orientation.y, pz = a.orientation.z + b.orientation.z,
+                        pw = a.orientation.w + b.orientation.w;
+            const float turn = std::min(mx * mx + my * my + mz * mz + mw * mw, px * px + py * py + pz * pz + pw * pw);
+            return dx * dx + dy * dy + dz * dz < 1e-6f && turn < 2e-7f;
+        };
+        // Both world views alike with the empty layer's (eye by eye).
+        const bool poses_match = projection_layer_views.size() == 2 && same_pose(projection_layer_views[0].pose, vd_views[0].pose) &&
+                                 same_pose(projection_layer_views[1].pose, vd_views[1].pose);
+        // Which way this frame goes (VdFixWay): left out, or sent and why.
+        int way = vd_left_out_play;
+        if (this->panel_mode && menu_world != 0) {
+            // (fix200) Behind a menu the world as it is now is drawn and submitted with this frame's kept poses, as in play: when it is the
+            // first layer (the menu not drawn into it) and both views match, the empty layer would only repeat its head position, so it
+            // is left out as in play. Sent as before behind the world as it was (seen from where the eyes were then), with the menu drawn
+            // into the world (the poses it was drawn with), and when a pose differs.
+            if (menu_world == 1 && live_world_first && poses_match) {
+                way = vd_left_out_menu;
+            } else if (menu_world == 2) {
+                way = vd_sent_menu_as_it_was;
+            } else if (menu_drawn_in) {
+                way = vd_sent_menu_drawn_in;
+            } else {
+                way = vd_sent_menu_pose;
+            }
+        } else if (world_submitted) {
+            // The world's picture submitted as in play (fix200: also so while a menu's panel is not ready yet, and on the flat screen's
+            // frames that show the world instead of the screen, as AER's can): counted and treated as in play.
+            if (projection_layer_views.size() != 2 || layers.front() != (XrCompositionLayerBaseHeader*)&layer) {
+                way = vd_sent_play_not_first;
+            } else if (!poses_match) {
+                way = vd_sent_play_pose;
+            }
+        } else if (this->panel_mode) {
+            // (No world behind the panel: the main menu, a loading screen, darkness; fix200: or the world as it was left out for VectorXR.)
+            way = this->frozen_left_out ? vd_sent_menu_world_left_out : vd_sent_menu_no_world;
+        } else if (this->flat_screen_mode) {
+            way = vd_sent_flat_screen;
+        } else {
+            way = vd_sent_play_not_first; // (in play with no world's picture this frame)
+        }
+        // (fix200) VectorXR's Frame Generation makes its frames from the first projection layer, taking each picture as the game hands
+        // the image back (at its release). The empty layer's image is handed back only once, when the strip is set up, so with it first
+        // Frame Generation never has a picture to work from: it then re-sends the game's frames itself, and the world's picture behind
+        // it (a second projection layer, handed back every frame) is passed on outside its usual handling. Twice the game stopped that
+        // way in the pause menu as Frame Generation started (the graphics card hung); at the main menu (no world picture behind the empty
+        // layer) and in play (the world first) it did not. So while its Frame Generation may run this session, the empty layer is never
+        // put before the world's picture (the world as it is now, or the last live picture shown again for a moment: both are copied into
+        // the eye images every frame): the world is then the first layer, as in play, and Virtual Desktop puts the rest together from the
+        // world's head position (this frame's, or within 45 frames of it). The world as it was, from before an opaque menu, is not shown
+        // then at all (the graphics side: frozen_left_out), so the panel never moves with the head. With no world's picture (the main menu,
+        // a loading screen, the flat screen, that case) it is still sent: nothing else is a projection then. The choice is made for each
+        // frame from what it holds, so no frame has the empty layer before the world's picture while this holds, however menus change.
+        const bool world_in_frame = std::find(layers.begin(), layers.end(), (XrCompositionLayerBaseHeader*)&layer) != layers.end();
+        if (way >= vd_sent_menu_no_world && world_in_frame && this->vectorxr_framegen.load()) {
+            const bool behind_menu = way <= vd_sent_menu_pose;
+            if (!this->vd_fix_vectorxr_logged) {
+                this->vd_fix_vectorxr_logged = true;
+                const char* why = way == vd_sent_menu_as_it_was ? "the world as it was"
+                                  : way == vd_sent_menu_drawn_in ? "the menu drawn into the world"
+                                  : way == vd_sent_menu_pose || way == vd_sent_play_pose ? "a pose differed"
+                                  : way == vd_sent_play_not_first ? "the world not first"
+                                                                  : "another layout";
+                spdlog::info("[VR] (fix200) Virtual Desktop fix: VectorXR's Frame Generation may run this session: the empty layer is not put before "
+                             "the world's picture ({}, {}); the world is the first layer, as in play ({} layers this frame)",
+                    behind_menu ? "behind a menu" : "elsewhere", why, layers.size());
+            }
+            way = behind_menu ? vd_left_out_vectorxr_menu : vd_left_out_vectorxr_play;
+        }
+        if (way == vd_left_out_play) {
+            if (!this->vd_fix_skip_logged) {
+                this->vd_fix_skip_logged = true;
+                spdlog::info("[VR] (fix197) Virtual Desktop fix: in play the world's picture is the first layer, with this frame's head position: the "
+                             "empty layer is not sent then (it still is behind menus and on the flat screen; {} layers this frame)", layers.size());
+            }
+        } else if (way == vd_left_out_menu) {
+            if (!this->vd_fix_menu_skip_logged) {
+                this->vd_fix_menu_skip_logged = true;
+                spdlog::info("[VR] (fix200) Virtual Desktop fix: behind a menu the world as it is now is the first layer, with this frame's head "
+                             "position: the empty layer is not sent then, as in play ({} layers this frame)", layers.size());
+            }
+        } else if (way >= vd_sent_menu_no_world) {
+            vd_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            vd_layer.space = this->stage_space;
+            vd_layer.viewCount = 2;
+            vd_layer.views = vd_views.data();
+            layers.insert(layers.begin(), (XrCompositionLayerBaseHeader*)&vd_layer);
+            strip_submitted = true;
+            if (!this->vd_fix_logged) {
+                this->vd_fix_logged = true;
+                spdlog::info("[VR] Virtual Desktop fix: an empty layer with this frame's head position is sent first ({} layers this frame)", layers.size());
+            }
+        }
+        ++this->vd_fix_ways[way];
+        // (fix197, fix200) Which way the frames went, every minute of frames (for the log: in play it should be left out nearly always; "a
+        // pose differed" would mean the world's views were not this frame's kept poses; behind a see-through menu the world as it is now
+        // should be first nearly always).
+        uint32_t total = 0;
+        for (const uint32_t n : this->vd_fix_ways) {
+            total += n;
+        }
+        if (total >= 3600 && this->vd_fix_count_logs < 30) {
+            ++this->vd_fix_count_logs;
+            const auto& w = this->vd_fix_ways;
+            uint32_t sent = 0;
+            for (int i = vd_sent_menu_no_world; i < vd_ways; ++i) {
+                sent += w[i];
+            }
+            spdlog::info("[VR] (fix200) Virtual Desktop fix, the last {} frames: the empty layer left out in {} (the world first as in play {}; "
+                         "behind a menu, the world as it is now first {}; for VectorXR's Frame Generation, behind a menu {}, elsewhere {}); sent "
+                         "first in {} (behind a menu: no world {}, the world as it was left out for VectorXR's Frame Generation {}, the world as it "
+                         "was {}, the menu drawn into the world {}, a pose differed {}; the flat screen {}; the world not first or none {}, a pose "
+                         "differed {}){}",
+                total, total - sent, w[vd_left_out_play], w[vd_left_out_menu], w[vd_left_out_vectorxr_menu], w[vd_left_out_vectorxr_play], sent,
+                w[vd_sent_menu_no_world], w[vd_sent_menu_world_left_out], w[vd_sent_menu_as_it_was], w[vd_sent_menu_drawn_in],
+                w[vd_sent_menu_pose], w[vd_sent_flat_screen], w[vd_sent_play_not_first], w[vd_sent_play_pose],
+                this->vectorxr_framegen.load() ? " (VectorXR's Frame Generation may run: never before the world's picture)" : "");
+            this->vd_fix_ways = {};
         }
     }
 
@@ -3456,6 +3776,19 @@ XrResult OpenXR::end_frame() {
             this->console_shown_ms = conv_now_ms;
         }
     }
+    // (fix196) The mod's own menu's panel likewise (frames without the strip's layers: then it is what was refused): three times, not shown
+    // again this session; the framework then draws the menu into the game's picture, as before.
+    if (fw_menu_submitted) {
+        if (layers_refused && !strip_submitted) {
+            if (++this->fw_menu_refusals >= 3 && !this->fw_menu_refused.exchange(true)) {
+                spdlog::warn("[VR] (fix196) The mod's menu: the runtime refused frames with its panel three times ({}); it is drawn into the game's "
+                             "picture from now on", this->get_result_string(result));
+            }
+        } else if (XR_SUCCEEDED(result)) {
+            this->fw_menu_refusals = 0;
+            this->fw_menu_submitted_ms = conv_now_ms;
+        }
+    }
 
     this->last_world_views_valid = world_submitted && XR_SUCCEEDED(result);
 
@@ -3475,9 +3808,11 @@ XrResult OpenXR::end_frame() {
     this->aer_frame = false;
     this->panel_image_ready = false;
     this->frozen_ready = false;
+    this->frozen_left_out = false; // (fix200)
     this->live_world_ready = false;
     this->ambient_ready = false; // (fix164)
     this->console_image_ready = false; // (fix177)
+    this->fw_menu_image_ready = false; // (fix196)
 
     return result;
 }

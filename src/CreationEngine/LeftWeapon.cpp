@@ -1291,7 +1291,7 @@ namespace LeftWeapon
             if (state_was == 3 && state != 3 && state >= 0 && y_held && id != 0 && !g_sheathed.load()) {
                 g_sheathed.store(true);
                 pending = false;
-                told("put away", "Y held: your weapons put away");
+                told("put away", "reload held: your weapons put away");
             }
             // (Drawn by the game: the left one with it when Y is held for it: decided as Y is held 0.3 s (both) or let go (the right only);
             // the review.)
@@ -1304,7 +1304,7 @@ namespace LeftWeapon
                     if (id != 0 && g_sheathed.load()) {
                         g_sheathed.store(false);
                         pending = false;
-                        told("drawn", "Y held: your weapons drawn");
+                        told("drawn", "reload held: your weapons drawn");
                     }
                     deciding = false;
                 } else if (!g_y_down.load() || state == 0) {
@@ -1320,7 +1320,7 @@ namespace LeftWeapon
             if (g_put_alone.exchange(false) && id != 0 && !g_sheathed.load()) {
                 g_sheathed.store(true);
                 pending = false;
-                told("put away", "Y held with your own weapon away: the left one alone"); // (fix179)
+                told("put away", "reload held with your own weapon away: the left one alone"); // (fix179; fix194: the reload button, not Y)
             }
             if (g_toggle.exchange(false) && id != 0) {
                 const bool away = !g_sheathed.load();

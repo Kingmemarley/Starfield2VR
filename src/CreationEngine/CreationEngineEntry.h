@@ -1,5 +1,9 @@
 #pragma once
 #include <Mod.hpp>
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <vector>
 
 class CreationEngineEntry : public Mod
 {
@@ -15,8 +19,10 @@ public:
     std::optional<std::string> on_initialize() override;
     void                       on_frame() override;
     void                       on_present() override;
-    void                       on_draw_ui() override;
-    void                       on_draw_quick_ui() override;
+    // (fix196) The F11 menu's tabs (Mod::on_draw_main_ui): Main's few rows, Advanced's groups, Debug's tests and status lines.
+    void                       on_draw_main_ui(int part) override;
+    void                       on_draw_advanced_ui(int part) override;
+    void                       on_draw_debug_ui() override;
     void                       on_config_load(const utility::Config& cfg, bool ) override;
     void                       on_config_save(utility::Config& cfg) override;
 
@@ -67,6 +73,8 @@ private:
     const ModToggle::Ptr m_gun_reapply_before_animation{ ModToggle::create(generate_name("GunReapplyBeforeAnimation"), true) };
     const ModToggle::Ptr m_first_person_eye_lens{ ModToggle::create(generate_name("FirstPersonEyeLens"), true) };
     const ModToggle::Ptr m_alternative_joy_layout{ ModToggle::create(generate_name("JoyAlternativeLayout"), false) };
+    // (fix194) The face buttons as printed (GameFlow::gStore.internalSettings.faceButtonsAsPrinted); off: the old layout.
+    const ModToggle::Ptr m_face_buttons_as_printed{ ModToggle::create(generate_name("FaceButtonsAsPrinted"), true) };
     // Shown body (ported from SFVR): third-person body in first person, arms on the controllers, gun in the hand.
     const ModToggle::Ptr m_show_body{ ModToggle::create(generate_name("ShowBody"), true) };
     const ModToggle::Ptr m_aim_with_gun_hand{ ModToggle::create(generate_name("AimWithGunHand"), true) };
@@ -82,6 +90,12 @@ private:
     const ModToggle::Ptr m_desktop_window_on_main_menu{ ModToggle::create(generate_name("DesktopWindowOnMainMenu"), true) };
     const ModToggle::Ptr m_real_crouch{ ModToggle::create(generate_name("RealCrouch"), false) };
     const ModToggle::Ptr m_crouch_view{ ModToggle::create(generate_name("CrouchLowersView"), true) };
+    // (fix195) Weapon steadiness (GameFlow::gStore.internalSettings: tieViewToBody, lockGunGrip, virtualStock).
+    const ModToggle::Ptr m_tie_view_to_body{ ModToggle::create(generate_name("TieViewToBody"), true) };
+    const ModToggle::Ptr m_lock_gun_grip{ ModToggle::create(generate_name("LockGunGrip"), true) };
+    const ModToggle::Ptr m_virtual_stock{ ModToggle::create(generate_name("VirtualStock"), true) };
+    // (fix199) Seated: the view at the seated body's eyes (GameFlow::gStore.internalSettings.seatViewAtEyes, SeatView).
+    const ModToggle::Ptr m_seat_view_at_eyes{ ModToggle::create(generate_name("SeatViewAtEyes"), true) };
 
     // Turning, vibration, pointing and melee.
     inline static const std::vector<std::string> s_turn_mode{
@@ -184,18 +198,35 @@ private:
     const ModToggle::Ptr m_shove_anger{ ModToggle::create(generate_name("ShoveAnger"), true) };
     const ModToggle::Ptr m_spare_followers{ ModToggle::create(generate_name("SpareFollowers"), true) };
 
+    // (fix198) The game's Settings > VR tab's "Recenter now" (a checkbox that acts once and unticks itself): never saved (not in m_options).
+    const ModToggle::Ptr m_vr_tab_recenter{ ModToggle::create(generate_name("VrTabRecenterNow"), false) };
+    // (fix198, the review) The frame step's thread (on_frame): a VR tab change made on another thread is kept for it (its apply run at the
+    // next frame step, in order); the eye mode chosen there until it is set (-1: none), shown by the tab meanwhile; the tab's rows asked
+    // for again one frame step after "Recenter now" (so it shows unticked even if the game's own refresh came after ours).
+    std::atomic<uint32_t>              m_frame_thread{ 0 };
+    std::mutex                         m_vr_tab_mtx;
+    std::vector<std::function<void()>> m_vr_tab_queue;
+    std::atomic<int>                   m_eye_mode_pending{ -1 };
+    std::atomic<bool>                  m_vr_tab_refresh{ false };
+    // Runs `fn` now on the frame step's thread (or before it is known), else queues it for that thread.
+    void on_frame_thread(std::function<void()> fn);
+
     // Copies the body toggles above into the settings the body module reads.
     void apply_body_settings();
     // Copies the turning, vibration, pointing and melee settings above into the game settings.
     void apply_comfort_settings();
     // (fix186) The rows of the VR tab in the game's Settings (VrSettingsTab.h), bound to the settings above.
     void set_vr_tab_rows();
+    // (fix196) The settings' log lines after a change in the F11 menu; the interface parts list (Debug).
+    void log_body_settings();
+    void log_comfort_settings();
+    void draw_ui_parts_list();
 
 
-    ValueList m_options{*m_dominant_eye, *m_head_tracking_multiplier, *m_head_tracking_type, *m_taa_anf_nvidia_fix, *m_disable_zoom, *m_hud_scale, *m_hud_perspective, *m_alternative_joy_layout, *m_decoupled_pitch, *m_pawn_control_rotation, *m_sights_on_dominant_eye, *m_hud_on_optical_center, *m_weapon_stereo_depth, *m_gun_follows_controller, *m_gun_pitch_offset, *m_gun_yaw_offset, *m_gun_forward_offset, *m_gun_up_offset, *m_gun_head_reference, *m_recenter_after_loading, *m_detail_boost, *m_keep_gun_transform, *m_gun_reapply_before_animation, *m_force_full_detail, *m_first_person_eye_lens,
+    ValueList m_options{*m_dominant_eye, *m_head_tracking_multiplier, *m_head_tracking_type, *m_taa_anf_nvidia_fix, *m_disable_zoom, *m_hud_scale, *m_hud_perspective, *m_alternative_joy_layout, *m_face_buttons_as_printed, *m_decoupled_pitch, *m_pawn_control_rotation, *m_sights_on_dominant_eye, *m_hud_on_optical_center, *m_weapon_stereo_depth, *m_gun_follows_controller, *m_gun_pitch_offset, *m_gun_yaw_offset, *m_gun_forward_offset, *m_gun_up_offset, *m_gun_head_reference, *m_recenter_after_loading, *m_detail_boost, *m_keep_gun_transform, *m_gun_reapply_before_animation, *m_force_full_detail, *m_first_person_eye_lens,
         *m_show_body, *m_aim_with_gun_hand, *m_shoot_from_muzzle, *m_match_body_height, *m_body_lean, *m_body_facing, *m_support_hand, *m_finger_poses,
         *m_walking_legs, *m_body_tracking, *m_hand_tracking, *m_desktop_window_on_main_menu,
-        *m_real_crouch, *m_crouch_view,
+        *m_real_crouch, *m_crouch_view, *m_tie_view_to_body, *m_lock_gun_grip, *m_virtual_stock, *m_seat_view_at_eyes,
         *m_turn_mode, *m_snap_turn_degrees, *m_smooth_turn_speed, *m_level_view, *m_haptics, *m_haptic_strength,
         *m_haptic_game_rumble, *m_hand_interact, *m_hand_reach, *m_impact_melee, *m_melee_swing_speed, *m_melee_instant_hits, *m_melee_throw, *m_hand_grab,
         *m_grip_grab, *m_grab_stiffness, *m_grab_align, *m_two_hand_hold, *m_one_in_each_hand, *m_grab_in_hand, *m_grab_ignores_you, *m_gravity_gloves, *m_pull_range,

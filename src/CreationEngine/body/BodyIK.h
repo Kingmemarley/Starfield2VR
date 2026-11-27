@@ -25,6 +25,9 @@ namespace body
     // (fix148) On a ladder (LadderClimb::HeadWanted): the third-person body's head bone (C_Head) as the skeleton's update put it, game
     // world, within the last 100 ms; false without it.
     bool LadderHeadWorld(float head[3]);
+    // (fix199) Seated (SeatView): `under` whether the first-person camera's nodes hang under that head bone (shrinking the head would
+    // move the view then); false when the head bone or the camera is not known.
+    bool SeatCameraUnderHead(bool& under);
     // (fix146) Hooks the game's switch between first and third person: the bodies put as in first person before a turn to third person
     // (the shown body made the game take it for third person already and skip its animations: no ladder climbs).
     void InstallSwitchHook();
@@ -46,8 +49,11 @@ namespace body
     bool BarrelKnown();
     // The player fired: the weapon's pose in the first-person rig is sampled as its firing grip.
     void NotifyPlayerFired();
-    // The left hand holds the weapon's support grip (two-handed) this frame.
+    // The left hand holds the weapon's support grip (two-handed) this frame. (fix198: drawn on it, whether or not it steers the gun.)
     bool IsSupportHandOnGun();
+    // (fix198) The gun is held in both hands this frame (the left grip squeezed at its support grip, steering it): the left grip is the
+    // gun's, so the gamepad's left-grip combos and the favorites wheel stand down. Any thread.
+    bool GunHeldWithBothHands();
     // For the node log (NodeTreeDump): the player's first-person rig and third-person model (the body), as read now (either may
     // be null; not checked further: read them with guarded reads).
     void DebugRoots(RE::NiAVObject*& first_person, RE::NiAVObject*& third_person);

@@ -32,7 +32,8 @@ public:
 
     std::optional<std::string> on_initialize() override;
     void on_present() override;
-    void on_draw_ui() override;
+    void on_draw_advanced_ui(int part) override; // (fix196: the DLSS model)
+    void on_draw_debug_ui() override;    // (fix196: per-eye DLSS, the views behind menus, the status)
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
     void on_config_save(utility::Config& cfg) override;
 

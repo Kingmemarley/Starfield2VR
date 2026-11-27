@@ -222,23 +222,37 @@ void GameSettingsComponent::on_device_reset()
     apply_vr_settings("device reset");
 }
 
-void GameSettingsComponent::on_draw_ui()
+// (fix196) The F11 menu's Advanced tab: throwing at people (gameplay), the drawing that saves performance (the view and performance).
+void GameSettingsComponent::on_draw_advanced_ui(int part)
 {
-    if (!ImGui::CollapsingHeader(get_name().data())) {
+    if (part == 0 && menu_ui::group("Throwing")) {
+        m_throw_aim->draw("Aim throws at people");
+        menu_ui::hint("A thrown melee weapon locks onto the person your hand points at (a buzz) and flies at them.");
+    }
+    if (part == 1 && menu_ui::group("Drawing (performance)")) {
+        m_foveation->draw("Foveated shading");
+        menu_ui::hint("What the lens does not show is shaded coarsely, its outer ring at half detail (more fps, the middle as sharp).");
+        m_foveation_ring->draw("Foveated shading: where the ring starts");
+        menu_ui::hint("A share of the way to the lens edge: lower starts the coarser ring nearer the middle (more fps, less sharp at the sides).");
+        m_shadow_share->draw("Full stereo: shared sun shadows");
+        menu_ui::hint("The right eye uses the left eye's sun shadows instead of drawing its own (more fps).");
+        if (m_cheaper_drawing->draw("Cheaper drawing")) {
+            apply_vr_settings("switched");
+        }
+        menu_ui::hint("Clouds at half resolution, grass and rock shadows near you only (more fps; set in memory, never in your INI files).");
+    }
+}
+
+// (fix196) The Debug tab: the drawing tests.
+void GameSettingsComponent::on_draw_debug_ui()
+{
+    if (!menu_ui::group("Drawing tests")) {
         return;
     }
-    ImGui::Separator();
-    m_foveation->draw("Foveated shading (what the lens does not show shaded coarsely, its outer ring at half detail)");
-    m_foveation_ring->draw("Foveated shading: the ring starts at (share of the way to the lens edge)");
-    m_shadow_share->draw("Full stereo: the right eye uses the left eye's sun shadows (faster)");
     m_eye_share->draw("Full stereo: the right eye reuses the left eye's sky table, fog map and terrain blur (test only: their memory is reused by the game)");
     ImGui::TextUnformatted(EyeShare::Status().c_str());
     m_gpu_timer->draw("GPU timer (one frame in 31 measured, written to the log)");
-    m_throw_aim->draw("Throwing: lock onto the person your hand points at (a buzz), the throw flies at them");
     m_render_steps_test->draw("Test: the render steps of one frame behind the first see-through menu (log, menu_steps.jpg; stalls that menu a moment)");
-    if (m_cheaper_drawing->draw("Cheaper drawing (clouds at half resolution, grass and rock shadows near you only)")) {
-        apply_vr_settings("switched");
-    }
     auto creation_engine_settings = CreationEngineSettings::Get();
     {
         m_override_weapon_fov->draw("Override Weapon Fov");

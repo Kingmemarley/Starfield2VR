@@ -37,8 +37,27 @@ public:
     std::optional<std::string> on_initialize_d3d_thread() override;
     void on_present() override;
     void on_post_present() override;
-    void on_draw_ui() override;
-    void on_draw_quick_ui() override;
+    // (fix196) The F11 menu's tabs (Mod::on_draw_main_ui): the eye mode as one choice and the sharpness on Main; the rest in Advanced and
+    // Debug.
+    void on_draw_main_ui(int part) override;
+    void on_draw_advanced_ui(int part) override;
+    void on_draw_debug_ui() override;
+    int eye_mode_choice() const;          // 0 full stereo, 1 stereo with the eyes taking turns, 2 mono, 3 AER
+    void set_eye_mode_choice(int choice); // (the saved switches set together: MonoMode, AlternateEyeRendering, FullStereo)
+    // (fix198) The eye mode chosen in a menu (F11's, or the game's Settings > VR tab): as the eye-mode button, refused while video memory
+    // has been over its budget 3 s (to a heavier mode than the one chosen now: a line for the menus, two short buzzes, the log); true when
+    // set. The game thread (it sets the switches).
+    bool try_eye_mode_choice(int choice, const char* where);
+    // (fix198, the review) Its two halves: the refusal alone (any thread: the check reads atomics, the reason is kept under its lock, the
+    // buzz asked for through an atomic), true when refused; and the choice made without the check (the game thread).
+    bool eye_mode_refused(int choice, const char* where);
+    void choose_eye_mode(int choice);
+    bool eye_mode_refused_lately() const;
+    // The refusal's line while it is recent (8 s), else empty: a copy, made under its lock.
+    std::string eye_mode_refusal() const;
+    // (fix198) The resolution scale set from a menu: the headset's images remade at it once it has not changed for 750 ms and no game menu
+    // is shown (on_begin_rendering; inside a game menu it is applied as the menu closes). Any thread: it only notes the value and the time.
+    void apply_resolution_scale();
     void on_device_reset() override;
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
     void on_config_save(utility::Config& cfg) override;
@@ -466,8 +485,10 @@ public:
     const ModToggle::Ptr m_desktop_fix{ModToggle::create(generate_name("DesktopRecordingFixV2"), false)};
     const ModSlider::Ptr m_motion_controls_inactivity_timer{ModSlider::create(generate_name("MotionControlsInactivityTimer"), 30.0f, 100.0f, 30.0f)};
     const ModSlider::Ptr m_joystick_deadzone{ModSlider::create(generate_name("JoystickDeadzone"), 0.01f, 0.9f, 0.15f)};
-    // 0.8 by default (V2: a new default over saved configs): 64% of the pixels of the runtime's recommended size.
-    const ModSlider::Ptr m_resolution_scale{ModSlider::create(generate_name("OpenXRResolutionScaleV2"), 0.1f, 5.0f, 0.8f)};
+    // (fix198) 1.0 by default (the runtime's recommended size; 0.8 before, V2: 64% of its pixels). A config that saved the old 0.8 starts
+    // at 1.0 once (m_resolution_default_1, a one-time mark: a value chosen after that, 0.8 too, is kept).
+    const ModSlider::Ptr m_resolution_scale{ModSlider::create(generate_name("OpenXRResolutionScaleV2"), 0.1f, 5.0f, 1.0f)};
+    const ModToggle::Ptr m_resolution_default_1{ModToggle::create(generate_name("ResolutionDefault1Applied"), false)};
     // On by default (V3, fix139: a new default over saved configs). Off (fix138's): every view drawn with both eyes' lenses together,
     // which reach less far up than down, the centred frustum's unseen top trimmed (VR::update_frustums): sharper up and down, but the
     // game's tiled lighting takes each view as centred (lights left out of blocks of the picture: fix138's test, blocky dark patches).
@@ -486,6 +507,9 @@ public:
     // AER (fix136): one eye drawn each frame, each a headset frame of its own (the other eye's last picture with it). Off by default;
     // the toggle (left grip + right stick click) cycles stereo, mono, AER.
     const ModToggle::Ptr m_aer{ModToggle::create(generate_name("AlternateEyeRendering"), false)};
+    // (fix196) AER in the eye-mode button's cycle (left grip + right stick click). Off by default: the button switches stereo and mono only
+    // (AER, chosen in the menu, is then left for stereo at the next press).
+    const ModToggle::Ptr m_aer_in_button{ModToggle::create(generate_name("AerInModeButton"), false)};
     // Pipelined pacing (fix136): no wait on the game thread before each frame pair; the present thread paces the headset frames.
     const ModToggle::Ptr m_pipelined_pacing{ModToggle::create(generate_name("PipelinedPacing"), true)};
     std::chrono::steady_clock::time_point m_menu_seen_at{};
@@ -493,6 +517,34 @@ public:
     // (fix173) A switch the memory guard refused: its two short pulses (1: the first is due, 2: the second), when the next is (game thread).
     int m_refused_buzz_step{0};
     std::chrono::steady_clock::time_point m_refused_buzz_at{};
+    // (fix198, the review) A menu's refused eye mode: its buzz asked for from any thread (started on the game thread), and its line until
+    // a time (both under the lock: the menus read them on their own threads).
+    std::atomic<bool> m_refused_buzz_asked{false};
+    mutable std::mutex m_eye_mode_refused_mtx{};
+    std::chrono::steady_clock::time_point m_eye_mode_refused_until{};
+    std::string m_eye_mode_refused_why{};
+    // (fix198, the review) The sharpness last asked for by a menu (negative: none yet) and when it last changed (steady clock, ms).
+    std::atomic<float> m_res_asked_value{-1.0f};
+    std::atomic<int64_t> m_res_asked_ms{0};
+
+    // (fix197) VectorXR (an OpenXR API layer: its Frame Generation makes extra headset frames from the game's): its layer seen among the
+    // loader's as the instance is made; its status file then read every 3 s on a thread of its own (check_vectorxr_status), read only.
+    // Frame Generation makes new frames from the first projection layer with both views: AER's frames (one eye new, the other's older
+    // picture with it) do not suit it, so that is warned of in the log and the menu.
+    std::atomic<bool> m_vectorxr_layer{false};
+    std::atomic<bool> m_vectorxr_generating{false}; // (our process's, the file current)
+    std::atomic<int> m_vectorxr_multiplier{0};
+    std::atomic<bool> m_vectorxr_watching{false};
+    // (fix200) The session named by the last status file read (ours, current; a hash of its sessionId, 0 none), and the one named when
+    // the latest instance was made: a file still naming that one is from before it, and is not taken as "Frame Generation off".
+    std::atomic<uint64_t> m_vectorxr_last_session{0};
+    std::atomic<uint64_t> m_vectorxr_instance_session{0};
+    std::mutex m_vectorxr_mtx{};
+    std::string m_vectorxr_summary{}; // (under its lock: the last state, for the log and the menu)
+    bool m_vectorxr_conflict_told{false};
+    void start_vectorxr_watch();
+    void check_vectorxr_status();
+    bool vectorxr_aer_conflict() const { return m_vectorxr_generating.load() && is_aer(); }
 
     ValueList m_options{
         *m_set_standing_key,
@@ -502,6 +554,7 @@ public:
         *m_motion_controls_inactivity_timer,
         *m_joystick_deadzone,
         *m_resolution_scale,
+        *m_resolution_default_1,
         *m_requested_runtime,
         *m_swap_eyes,
         *m_symmetric_projection,
@@ -511,6 +564,7 @@ public:
         *m_mono_in_menus,
         *m_full_stereo,
         *m_aer,
+        *m_aer_in_button,
         *m_pipelined_pacing,
     };
 

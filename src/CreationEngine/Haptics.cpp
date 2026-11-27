@@ -79,10 +79,21 @@ namespace haptics
         }
     }
 
+    namespace
+    {
+        // (fix195) For BodyIK's grip lock: the last reload tap and the last shot (any thread).
+        std::atomic<int64_t> g_reload_tap_us{ -1'000'000'000'000 };
+        std::atomic<int64_t> g_last_shot_us{ -1'000'000'000'000 };
+    }
+
+    std::int64_t LastReloadTapUs() { return g_reload_tap_us.load(std::memory_order_relaxed); }
+    std::int64_t LastFiredUs() { return g_last_shot_us.load(std::memory_order_relaxed); }
+
     void PlayerFired()
     {
         g_fire_count.fetch_add(1);
         const auto t    = now_us();
+        g_last_shot_us.store(t, std::memory_order_relaxed); // (fix195)
         auto       last = g_fire_time_us.load();
         if (t - last >= kFireRetriggerUs) {
             g_fire_time_us.compare_exchange_strong(last, t);
@@ -133,6 +144,7 @@ namespace haptics
                        !GameFlow::isWorkshopShown()) { // (fix175: X deletes in build mode, no reload)
                 g_reload_support = { t, 0.05f, 0.55f };
                 g_reload_gun     = { t + 140'000, 0.05f, 0.7f };
+                g_reload_tap_us.store(t, std::memory_order_relaxed); // (fix195)
             }
             was_down = down;
         }

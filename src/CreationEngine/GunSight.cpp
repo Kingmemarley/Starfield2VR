@@ -219,6 +219,7 @@ namespace GunSight
 
     void Update(bool aiming_with_hand)
     {
+        MuzzleFire::Update(); // (fix195) the log's summary of a cutter's trigger pull, once it has ended
         static auto vr       = VR::get();
         const auto& settings = GameFlow::gStore.internalSettings;
         const bool  show     = settings.gunSight && aiming_with_hand && vr->is_hmd_active() && vr->is_using_controllers() && GameFlow::isWeaponDrawn() &&

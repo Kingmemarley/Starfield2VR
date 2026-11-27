@@ -16,6 +16,7 @@
 #include "CreationEngine/HandActions.h"
 #include "CreationEngine/TempleGestures.h"
 #include "CreationEngine/HandGrab.h"
+#include "CreationEngine/body/BodyIK.h"
 #include "CreationEngine/LeftWeapon.h"
 #include "CreationEngine/FavoritesWheel.h"
 #include "CreationEngine/MeleeThrow.h"
@@ -60,6 +61,15 @@ namespace {
         bool              rb_cut{ false }; // taken away: not back until the thumb leaves
         bool              rb_menu{ false }; // (fix192) this RB was on while a menu was shown: it ends as the menu does
         Clock::time_point rb_touched_at{};  // (fix192, the review) when the thumb was last on the rest (a cut ends only once it has been off a while)
+        // (fix194) The touches that start just after a menu closed (kAfterMenu): the thumb coming back from the button that closed it.
+        // (The review: a "menu" here is any place the face buttons close: a menu, a conversation, build mode, the hand scanner, the mod's own.)
+        bool              menu_was{ false };      // such a place was shown at the last poll
+        Clock::time_point menu_closed_at{};       // when the last one closed
+        bool              lb_after_menu{ false }; // the left thumb's touch began just after a menu closed: no LB until it leaves a while
+        Clock::time_point lb_touched_at{};        // when the left thumb was last on its rest
+        int               after_menu_logs{ 0 };
+        bool              late_logged{ false };   // (the review) the first fresh RB touch 0.5-1.5 s after a close logged (for tuning kAfterMenu)
+        int               late_logs{ 0 };
         // The grips' taps (0 the left grip's LB, 1 the right grip's RB).
         bool              grip_was[2]{ false, false };
         bool              grip_queued[2]{ false, false };
@@ -80,6 +90,8 @@ namespace {
 
     // (fix179) The Y press held back while only the left hand's weapon is out (below): its state, reset while the mod's menu is drawn (the
     // review: a press held back as the menu opened gave a stray X tap, your weapon drawn, as it closed).
+    // (fix194) Named for the old layout, where Touch Y was the reload button: it is whichever button sends the game's X (reload; held, your
+    // weapons put away or drawn), Touch X with the face buttons as printed.
     struct YHold {
         bool                                  was_down{ false };
         bool                                  held_back{ false };
@@ -96,6 +108,7 @@ namespace {
     constexpr auto kWaitAtMost  = std::chrono::milliseconds(1000); // a press held back longer than this is dropped
     constexpr auto kThumbLeft   = std::chrono::milliseconds(100);  // (fix192, the review) the right thumb off its rest this long: a cut RB ends
     constexpr int  kPlaceDrawnMs = 100; // (fix192, the review) the scanner or build mode drawn this lately: the right grip's RB tap may run
+    constexpr auto kAfterMenu   = std::chrono::milliseconds(500);  // (fix194) a thumbrest touch begun this soon after a menu closed is no press
 
     // (fix189) The flat screen on or off (the headset's picture off: the game on the monitor), at most every half second, logged.
     void ToggleFlatScreen(const char* by)
@@ -220,50 +233,11 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto is_left_joystick_click_down = is_action_active(m_action_joystick_click, left_joystick);
     const auto is_right_joystick_click_down = is_action_active(m_action_joystick_click, right_joystick);
 
-    static bool ui_toggle_active = false;
-    bool both_clicks_down = is_left_joystick_click_down && is_right_joystick_click_down;
-
-    if (both_clicks_down && !ui_toggle_active) {
-        ui_toggle_active = true;
-        g_framework->set_draw_ui(!g_framework->is_drawing_ui());
-    } else if (!is_left_joystick_click_down && !is_right_joystick_click_down) {
-        ui_toggle_active = false; // (both let go: one still held after the toggle does not toggle again with the other)
-    }
-
-    // The stick clicks the game gets. Both sticks clicked together open or close this menu and must not also reach the game:
-    // the right stick's click is melee, which with nothing in your hands brings your fists out (and then the hands no longer
-    // grab), the left one's is sprint. So a stick's click goes to the game once it is clear the other is not joining it
-    // (held kStickComboWait on its own); a click shorter than that is sent as a short press once it ends. A click that was
-    // ever down together with the other's goes nowhere, until it is let go.
-    bool send_stick_click[2]{ false, false }; // left, right
-    {
-        constexpr auto kStickComboWait  = std::chrono::milliseconds(100);
-        constexpr auto kStickClickPulse = std::chrono::milliseconds(60);
-        static std::chrono::steady_clock::time_point down_since[2]{};
-        static std::chrono::steady_clock::time_point pulse_until[2]{};
-        static bool                                  was_down[2]{ false, false };
-        static bool                                  in_combo[2]{ false, false }; // this click was down together with the other's
-        static bool                                  sent[2]{ false, false };     // this click went to the game while held
-        const bool                                   down[2]{ is_left_joystick_click_down, is_right_joystick_click_down };
-        for (int i = 0; i < 2; ++i) {
-            if (down[i] && !was_down[i]) {
-                down_since[i] = now;
-                in_combo[i]   = false;
-                sent[i]       = false;
-            }
-            if (down[i] && down[1 - i]) {
-                in_combo[i] = true;
-            }
-            if (!down[i] && was_down[i] && !in_combo[i] && !sent[i]) {
-                pulse_until[i] = now + kStickClickPulse; // a quick click on its own
-            }
-            if (down[i] && !in_combo[i] && now - down_since[i] >= kStickComboWait) {
-                sent[i] = true;
-            }
-            send_stick_click[i] = (down[i] && sent[i]) || (!down[i] && now < pulse_until[i]);
-            was_down[i]         = down[i];
-        }
-    }
+    // The stick clicks the game gets: the left one's is sprint, the right one's melee. (fix198) This menu opens and closes with F11
+    // only (its window's close button closes it too): both sticks clicked together no longer toggle it, now that the everyday settings
+    // are in the game's own Settings > VR tab. So each click goes to the game as it is, also both together, with no wait to see whether
+    // the other stick joins it (before, a click was held back 100 ms for that, and one down together with the other's went nowhere).
+    const bool send_stick_click[2]{ is_left_joystick_click_down, is_right_joystick_click_down }; // left, right
 
     const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
     const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
@@ -271,13 +245,26 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto is_right_b_button_down = is_action_active_any_joystick(b_button_right);
     const auto is_left_b_button_down = is_action_active_any_joystick(b_button_left);
 
+    // (fix194) The face buttons. As printed (setting FaceButtonsAsPrinted, on by default): each Touch button sends the game's button of
+    // the same letter (right A = A, right B = B, left X = X, left Y = Y), so the game's prompts name the button to press, and back (B, the
+    // right hand) is no longer next to drop (X, the left hand): in the old layout both were under the left thumb, one above the other, and
+    // a slip off back dropped the item. The letters are printed on the controllers, so Swap Controller Inputs does not move them. Off: the
+    // old layout exactly, the hands swapped with Swap Controller Inputs as before (right A = A, left X = B, right B = Y, left Y = X).
+    // Starfield's own actions: A use, take, talk (menus: select); B sneak (menus: back); X reload, held: your weapons put away or drawn
+    // (menus: drop, transfer; build mode: delete); Y jump, in the air the boost pack (menus: favorite; Settings: defaults).
+    const bool as_printed = GameFlow::gStore.internalSettings.faceButtonsAsPrinted;
+    const bool face_a = as_printed ? is_action_active_any_joystick(m_action_a_button_right) : is_right_a_button_down; // the game's A
+    const bool face_b = as_printed ? is_action_active_any_joystick(m_action_b_button_right) : is_left_a_button_down;  // the game's B
+    const bool face_x = as_printed ? is_action_active_any_joystick(m_action_a_button_left) : is_left_b_button_down;   // the game's X (reload)
+    const bool face_y = as_printed ? is_action_active_any_joystick(m_action_b_button_left) : is_right_b_button_down;  // the game's Y
+
     if (g_framework->is_drawing_ui()) {
         // (fix179, the review) A Y press held back below ends here: the mod's menu has the buttons now; no tap of X once it closes, and a
         // press held through the menu reaches the game in no way until it is let go.
-        g_y_hold.held_back = is_left_b_button_down;
+        g_y_hold.held_back = face_x;
         g_y_hold.done      = true;
         g_y_hold.tap_until = {};
-        g_y_hold.was_down  = is_left_b_button_down;
+        g_y_hold.was_down  = face_x;
         // (fix192, the review) The thumbrests and the grips' taps likewise, their state taken as it stands now: closing the mod's menu with a
         // thumb resting is no fresh touch (the right one's RB in play readied a grenade, thrown as the thumb left), an RB held into the menu does
         // not come back as a fresh press, and a resting right thumb gives no RB until it leaves its rest and touches again; no grip's tap waits
@@ -296,48 +283,50 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             sh.grip_was[1]  = is_action_active(m_action_grip, right_joystick);
             sh.grip_queued[0] = sh.grip_queued[1] = false;
             sh.grip_until[0] = sh.grip_until[1] = {};
+            sh.menu_was     = true; // (fix194, the review) the mod's menu counts as a place: closing it starts the touch guard's window
         }
         return;
     }
 
-    // (fix179) A (jump; in the air the boost pack) held back while a hand holds you on a wall (Climbing), a press begun then until it is let
-    // go (it would fire the boost pack against the hold, or jump as you let go).
+    // (fix179) The game's A (use: take, open, talk) held back while a hand holds you on a wall (Climbing), a press begun then until it is
+    // let go. (fix194: this comment called A jump before; Starfield's jump is Y, which is not held back here.)
     {
         static bool a_held_back = false;
-        if (Climbing::Active() && is_right_a_button_down) {
+        if (Climbing::Active() && face_a) {
             a_held_back = true;
-        } else if (!is_right_a_button_down) {
+        } else if (!face_a) {
             a_held_back = false;
         }
-        if (is_right_a_button_down && !a_held_back) {
+        if (face_a && !a_held_back) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_A;
         }
     }
 
-    if (is_left_a_button_down) {
+    if (face_b) { // (fix194: Touch B as printed, Touch X in the old layout)
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_B;
     }
 
-    if (is_right_b_button_down) {
+    if (face_y) { // (fix194: Touch Y as printed, Touch B in the old layout)
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_Y;
     }
 
-    // (fix179) Y held with only the left hand's weapon out (your own put away): the game would take it as "draw your weapons" (with the right
-    // melee weapon put away and the left one out, Y held should sheath the left one). Such a press (judged as it starts, in play) is
-    // held back from the game: held 0.35 s, the left one is put away alone; let go sooner, it reaches the game as a tap then (60 ms).
+    // (fix179) The reload button (the game's X; fix194: Touch X as printed, Touch Y in the old layout) held with only the left hand's weapon
+    // out (your own put away): the game would take it as "draw your weapons" (with the right melee weapon put away and the left one out, the
+    // button held should sheath the left one). Such a press (judged as it starts, in play) is held back from the game: held 0.35 s, the left
+    // one is put away alone; let go sooner, it reaches the game as a tap then (60 ms).
     // (The review: its state is g_y_hold, reset while the mod's menu is drawn, above.)
     {
         auto&      y     = g_y_hold;
         const auto y_now = std::chrono::steady_clock::now();
-        if (is_left_b_button_down && !y.was_down) {
+        if (face_x && !y.was_down) {
             y.held_back = !GameFlow::isShowingMenu() && !GameFlow::isInDialogue() && !GameFlow::isWorkshopShown() && !GameFlow::isPilotingShip() &&
                           GameFlow::isInFirstPerson() && LeftWeapon::OnlyLeftOut();
             y.since = y_now;
             y.done  = false;
         }
-        bool send = is_left_b_button_down;
+        bool send = face_x;
         if (y.held_back) {
-            if (is_left_b_button_down) {
+            if (face_x) {
                 send = false;
                 if (!y.done && y_now - y.since >= std::chrono::milliseconds(350)) {
                     y.done = true;
@@ -350,20 +339,20 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                 y.held_back = false;
             }
         }
-        y.was_down = is_left_b_button_down;
+        y.was_down = face_x;
         if (send || y_now < y.tap_until) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_X;
         }
     }
 
-    // (fix157) Two quick presses of the left controller's upper button (Y): the left hand's weapon put away, or drawn again (the left
-    // hand's melee weapon sheathed with two quick Y presses, both sheathed with Y held as before).
+    // (fix157) Two quick presses of the reload button (fix194: Touch X as printed, Touch Y in the old layout): the left hand's weapon put
+    // away, or drawn again (the left hand's melee weapon sheathed with two quick presses, both sheathed with the button held as before).
     // The presses still reach the game (X: a tap reloads; held, the game puts your weapons away, the left one with them).
     {
         static bool was_down = false;
         static auto first_at = std::chrono::steady_clock::time_point{};
-        const bool  pressed  = is_left_b_button_down && !was_down;
-        was_down             = is_left_b_button_down;
+        const bool  pressed  = face_x && !was_down;
+        was_down             = face_x;
         if (pressed && !GameFlow::isShowingMenu() && !GameFlow::isWorkshopShown()) { // (fix175: nor in build mode, where it is X: delete)
             if (first_at != std::chrono::steady_clock::time_point{} && now - first_at < std::chrono::milliseconds(400)) {
                 LeftWeapon::ToggleSheathed();
@@ -375,12 +364,31 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     }
 
 
+    // (fix198) The left grip holding the gun in both hands (body::GunHeldWithBothHands: squeezed at the gun's support grip): the grip is the
+    // gun's, so its combos stand down while it is held (the eye mode below, the flat screen, the system button's back, the alternative
+    // layout's LB/RB and D-pad); a squeeze begun with the left hand already drawn on the gun counts so from its start (the body decides a
+    // frame after this poll), until let go.
+    bool gun_grip = false;
+    {
+        static bool left_grip_was  = false;
+        static bool gun_grip_latch = false;
+        const bool  left_grip_now  = is_action_active(m_action_grip, left_joystick);
+        if (left_grip_now && !left_grip_was && body::IsSupportHandOnGun()) {
+            gun_grip_latch = true;
+        }
+        if (!left_grip_now) {
+            gun_grip_latch = false;
+        }
+        left_grip_was = left_grip_now;
+        gun_grip      = left_grip_now && (gun_grip_latch || body::GunHeldWithBothHands());
+    }
+
     // Mono / stereo: with the left grip already held, click the right stick.
     // That click does not also melee (held, or as the short press a quick click is sent as), until the next click.
     // A short buzz in both hands.
     // (fix173) Whatever the left hand holds: the click was skipped while the left hand counted as holding something (HandGrab::HeldCurl), and
     // since fix170 a hand also counts while it holds an object on its own or as the second hand on one, so the switch often did nothing.
-    // The left grip held and then a click of the right stick is a deliberate combo; both stick clicks together stay this menu's.
+    // The left grip held and then a click of the right stick is a deliberate combo.
     bool mono_click = false;
     {
         static bool right_click_was_down = false;
@@ -390,8 +398,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (clicked) {
             mono_press = false;
         }
-        if (clicked && !is_left_joystick_click_down && is_action_active(m_action_grip, left_joystick)) {
-            // (Stereo, mono, AER in turn: a short buzz for mono, a long one for AER, a medium one back to stereo.)
+        if (clicked && !is_left_joystick_click_down && is_action_active(m_action_grip, left_joystick) && !gun_grip) {
+            // (Stereo, mono, AER in turn: a short buzz for mono, a long one for AER, a medium one back to stereo. fix196: with AER out of the
+            // button, the default ("Include AER in the eye-mode button" off), a press from mono goes back to stereo: the long buzz means that;
+            // from AER chosen in the menu, the medium one.)
             const float buzz = m_mono->value() ? 0.25f : (m_aer->value() ? 0.15f : 0.08f);
             toggle_mono();
             trigger_haptic_vibration(0.0f, buzz, 0.0f, 0.5f, left_joystick);
@@ -438,8 +448,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto is_right_grip_down = right_grip_raw && !wheel.open;
 
     // (fix158) The left trigger draws the left hand's weapon when it is put away (if it is
-    // equipped): a fresh pull, not with the left grip (the d-pad), at the temple (the flashlight), on a menu or the favorites wheel; and Y
-    // held is noted (your weapons drawn with Y held draw both).
+    // equipped): a fresh pull, not with the left grip (the d-pad), at the temple (the flashlight), on a menu or the favorites wheel; and the
+    // reload button held is noted (your weapons drawn with it held draw both; fix194: Touch X as printed, Touch Y in the old layout).
     {
         static bool left_trigger_was = false;
         const bool  fresh            = is_left_trigger_down && !left_trigger_was;
@@ -450,8 +460,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             !Climbing::Active()) {          // (fix179: nor while a hand holds you on a wall: a weapon drawn would drop you)
             LeftWeapon::LeftTriggerPulled();
         }
-        // (fix179, the review) A Y press held back from the game (only the left weapon out, above) is no Y held for it.
-        LeftWeapon::NoteYHeld(is_left_b_button_down && !g_y_hold.held_back);
+        // (fix179, the review) A reload-button press held back from the game (only the left weapon out, above) is no hold for it.
+        LeftWeapon::NoteYHeld(face_x && !g_y_hold.held_back);
     }
 
 
@@ -465,7 +475,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     {
         const bool left_grip_busy = HandGrab::SuppressLeftGripDpad() || HandGrab::HoldingWith(true) || Physical::HoldingPerson(true) ||
                                     left_grip_climbs || Climbing::Active() || HandActions::GripIsShoulder(true) || MeleeThrow::Available(true) ||
-                                    MeleeThrow::Away(true);
+                                    MeleeThrow::Away(true) || gun_grip; // (fix198: sprinting with the gun in both hands)
         if (is_left_joystick_click_down && is_left_grip_down && !left_grip_busy) {
             ToggleFlatScreen("the left grip held with the left stick clicked");
         }
@@ -473,7 +483,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     const auto system_button_down = is_action_active_any_joystick(m_action_system_button);
     if(system_button_down) {
-        if(is_left_grip_down) {
+        if(is_left_grip_down && !gun_grip) { // (fix198: the gun's grip is no back modifier)
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_BACK;
             pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_START;
         } else {
@@ -526,9 +536,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     // (fix157) The favorites menu (the quick-select wheel, drawn in the HUD layer): a fresh pull of a trigger chooses the selected favorite
     // as A does (the right trigger for the right weapon and the left trigger for the left weapon): A sent for a moment, only while
-    // the menu is drawn (never into play: A jumps), and the trigger noted for LeftWeapon (a melee weapon chosen with the left one goes to
-    // the left hand). That trigger is kept from the game until it is let go (else it would fire what was just equipped as the menu
-    // closes); a pull while the left stick is pushed (moving through the menu with the d-pad) does not choose.
+    // the menu is drawn (never into play: A is use there; fix194: this said A jumps), and the trigger noted for LeftWeapon (a melee
+    // weapon chosen with the left one goes to the left hand). That trigger is kept from the game until it is let go (else it would fire
+    // what was just equipped as the menu closes); a pull while the left stick is pushed (moving through the menu with the d-pad) does not
+    // choose.
     static bool fav_held[2]{ false, false };
     {
         static bool fav_was[2]{ false, false };
@@ -577,11 +588,11 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                 choose(h, true);
             }
         }
-        // (The game's own A there: the right hand's.)
-        if (is_right_a_button_down && !fav_a_was && GameFlow::isFavoritesShown()) {
+        // (The game's own A there: the right hand's. fix194: the button that sends the game's A.)
+        if (face_a && !fav_a_was && GameFlow::isFavoritesShown()) {
             LeftWeapon::NoteFavoritesPress(false);
         }
-        fav_a_was = is_right_a_button_down;
+        fav_a_was = face_a;
         if (now < fav_a_until && GameFlow::isFavoritesDrawnNow()) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_A;
         }
@@ -611,7 +622,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     // The trigger that equipped a picked-up weapon, still held once the weapon is out: it fires (a fresh press for the game).
     // (Only while the trigger is still down, as the game would fire; not the alternative layout's left grip + trigger, which is RB.)
     if (HandGrab::FireOverride() == 1 && is_right_trigger_down &&
-        !(is_left_grip_down && GameFlow::gStore.internalSettings.alternativeJoyLayout)) {
+        !(is_left_grip_down && !gun_grip && GameFlow::gStore.internalSettings.alternativeJoyLayout)) {
         pXinputGamepad->bRightTrigger = 255;
     }
     // A picked-up weapon put in the bag with no weapon before it: put away (reload held); one just equipped: drawn (reload tapped).
@@ -626,22 +637,47 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     // (A grenade taken from behind the shoulder has the grenade button to itself until the game has thrown it.)
     const bool grenade_button_owned = HandActions::OwnsGrenadeButton();
     auto&      sh                   = g_shoulders;
+    // (fix194) When the last menu closed (looked at each poll, whatever the layout). A thumb that pressed the button closing a menu comes back
+    // to its rest a moment later: with the face buttons as printed back is Touch B, under the right thumb, and that fresh touch in play was
+    // RB, a grenade readied (thrown as the thumb lifts); in the old layout back is Touch X, under the left thumb, and its LB tap toggled the
+    // scanner. So a touch that starts within kAfterMenu of a menu closing is no press, on either side and in both layouts, until the thumb
+    // leaves its rest and touches again (below). A thumb resting through the menu's end is not new: fix192's rules for it stand.
+    // (The review) "A menu" is any place the face buttons close: a menu, a conversation, build mode, the hand scanner (and the mod's own menu,
+    // above); and a menu still counted as shown while no full-screen menu has been drawn for 100 ms (nor a conversation) is closing: a touch
+    // then is the same thumb coming back. The menu is read once a poll (in_menu below is this one).
+    const bool menu_now = GameFlow::isShowingMenu();
+    {
+        const bool place_now = menu_now || GameFlow::isDialogueDrawnNow() || GameFlow::isWorkshopShown(kPlaceDrawnMs) ||
+                               GameFlow::isScannerDrawnWithin(kPlaceDrawnMs);
+        if (sh.menu_was && !place_now) {
+            sh.menu_closed_at = now;
+            sh.late_logged    = false;
+        }
+        sh.menu_was = place_now;
+    }
+    const bool closed_once     = sh.menu_closed_at != Shoulders::Clock::time_point{};
+    const auto since_close_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - sh.menu_closed_at).count();
+    const bool just_after_menu = !sh.menu_was && closed_once && now - sh.menu_closed_at < kAfterMenu;
+    const bool menu_closing    = menu_now && !GameFlow::isFullscreenMenuDrawnWithin(100) && !GameFlow::isDialogueDrawnNow();
+    const bool touch_guard     = just_after_menu || menu_closing;
     if (GameFlow::gStore.internalSettings.alternativeJoyLayout) {
         // (The alternative layout: the left grip with a trigger is LB or RB, as before; the thumbrests are not shoulder buttons.)
         sh.lb_touch_was = sh.rb_touch_was = false;
         sh.lb_pending = sh.lb_on = sh.lb_menu = sh.rb_pending = sh.rb_on = sh.rb_cut = sh.rb_menu = false;
-        if (is_left_grip_down && is_right_trigger_down && !right_trigger_held_back) {
+        sh.lb_after_menu = false; // (fix194)
+        // (fix198: not the gun's grip, held in both hands: the right trigger fires then.)
+        if (is_left_grip_down && !gun_grip && is_right_trigger_down && !right_trigger_held_back) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
             pXinputGamepad->bRightTrigger = 0;
         }
-        if (is_left_grip_down && is_left_trigger_down && !fav_held[0] && !TempleGestures::HoldsTrigger(true)) {
+        if (is_left_grip_down && !gun_grip && is_left_trigger_down && !fav_held[0] && !TempleGestures::HoldsTrigger(true)) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
         }
     } else {
         // (fix173) The thumbrests' LB and RB, never both at once outside menus (Shoulders, above; in a menu they are its tabs, no power: each
         // as it comes, the review). The other button "out" means: not sent by the other thumbrest now, not in the last reports handed over
         // for kShoulderGap, no grip's tap of it running.
-        const bool in_menu  = GameFlow::isShowingMenu();
+        const bool in_menu  = menu_now; // (fix194, the review: read once, above)
         const bool rb_clear = in_menu || (!sh.rb_on && now - sh.rb_sent >= kShoulderGap && now >= sh.grip_until[1]);
         // The left thumbrest: LB tapped as the thumb touches it (fix158: not with the left grip squeezed: the thumb rests there as you hold or
         // throw the left weapon, and LB opened the scanner: the scanner was opening with the left grip; fix171: nor while the favorites
@@ -652,10 +688,28 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             const bool touch = thumbrest_touch_left_down;
             const bool fresh = touch && !sh.lb_touch_was;
             sh.lb_touch_was  = touch;
+            if (touch) {
+                sh.lb_touched_at = now;
+            }
+            // (fix194) A touch begun just after a menu closed (above) gives no LB, nor does any touch until the thumb has been off its rest
+            // kThumbLeft (a sensor dropout of a poll or two is not a new touch).
+            if (fresh && touch_guard) {
+                if (!sh.lb_after_menu && sh.after_menu_logs < 20) {
+                    ++sh.after_menu_logs;
+                    spdlog::info("[Buttons] (fix194) the left thumb came back to its rest {}: no LB (the scanner) until it leaves the rest and "
+                                 "touches again",
+                        menu_closing ? std::string{ "as a menu closed" } : fmt::format("{} ms after a menu closed", since_close_ms));
+                }
+                sh.lb_after_menu = true;
+            } else if (!touch && now - sh.lb_touched_at >= kThumbLeft) {
+                sh.lb_after_menu = false;
+            }
             // (fix175, the review: not in build mode: LB is its category there, the grips give it; a thumb resting there changed categories.)
+            // (fix198) The gun's grip, held in both hands, counts as the grip here too: the thumb rests on the thumbrest as the hand holds the
+            // gun, as it did holding the left weapon (fix158), and its touch would open the scanner while aiming.
             const bool may   = !is_left_grip_down && !wheel.left_shoulder && !(GameFlow::isWorkshopShown() && !in_menu);
             if (fresh) {
-                sh.lb_pending    = may;
+                sh.lb_pending    = may && !sh.lb_after_menu;
                 sh.lb_pending_at = now;
                 sh.lb_on         = false;
             }
@@ -714,6 +768,23 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                     sh.rb_cut = false;
                 }
             } else {
+                // (fix194) A touch begun just after a menu closed (above): taken away as the scanner's is, no RB until the thumb has been off
+                // its rest kThumbLeft and touches again.
+                if (fresh && touch_guard) {
+                    if (!sh.rb_cut && sh.after_menu_logs < 20) {
+                        ++sh.after_menu_logs;
+                        spdlog::info("[Buttons] (fix194) the right thumb came back to its rest {}: no RB (a grenade readied) until it leaves the "
+                                     "rest and touches again",
+                            menu_closing ? std::string{ "as a menu closed" } : fmt::format("{} ms after a menu closed", since_close_ms));
+                    }
+                    sh.rb_cut = true;
+                } else if (fresh && !sh.menu_was && closed_once && !sh.late_logged && since_close_ms < 1500 && sh.late_logs < 20) {
+                    // (The review, for tuning kAfterMenu) The first fresh touch after the window, within 1.5 s of the close: it is RB as usual.
+                    sh.late_logged = true;
+                    ++sh.late_logs;
+                    spdlog::info("[Buttons] (fix194) the right thumb touched its rest {} ms after a menu closed (after the guard's {} ms): RB as usual",
+                        since_close_ms, kAfterMenu.count());
+                }
                 if (GameFlow::isScannerOpen() && !sh.rb_cut && sh.scanner_logs < 20) {
                     ++sh.scanner_logs;
                     spdlog::info("[Buttons] (fix173) the right thumbrest touched in the hand scanner: no RB (its surface map) until the thumb leaves it");
@@ -746,8 +817,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             // poll with no menu shown it is taken away as the scanner's is, not back until the thumb leaves its rest. Kept on, the game got it in
             // play as a fresh press (the menu pointer's filter had kept it from the game until the panel went): with a grenade equipped it
             // readied one, thrown as the thumb left (a grenade equipped from a menu released one by itself on unpausing; the
-            // right thumb rests there as the right trigger equips, and the left hand closes the menu). Taken here, before the menu pointer's
-            // filter, so this very report has no RB. A touch made in play is RB as before.
+            // right thumb rests there as the right trigger equips, and the left hand closes the menu: the old layout's back, Touch X; fix194: as
+            // printed back is Touch B, and the right thumb's touch as it comes back from it is the guard's above). Taken here, before the menu
+            // pointer's filter, so this very report has no RB. A touch made in play is RB as before (fix194: but not one begun just after a menu
+            // closed).
             if (!sh.rb_on) {
                 sh.rb_menu = false;
             } else if (in_menu) {
@@ -921,7 +994,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const bool alternative_layout = GameFlow::gStore.internalSettings.alternativeJoyLayout;
     // (Not while the left hand's weapon is thrown: its trigger guides it and its grip calls it back; nor, in the alternative layout, the
     // grip alone while a left weapon is held: that grip throws it. The review.)
-    const bool dpad_combo = is_left_grip_down && !MeleeThrow::Away(true) &&
+    const bool dpad_combo = is_left_grip_down && !gun_grip && !MeleeThrow::Away(true) && // (fix198: not the gun's grip, held in both hands)
                             (alternative_layout ? !LeftWeapon::Held() : is_left_trigger_down && !fav_held[0]);
     // (fix166) While the favorites wheel is open the left stick alone moves through its slots (its D-pad), as the combo does, and does not walk
     // (the left stick is needed to move through every menu screen; the wheel's slots are the D-pad's: a helper's research).

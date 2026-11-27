@@ -26,6 +26,9 @@ namespace GameFlow
             bool nvidiaAndTAAfix{true};
             bool preventZoom{false};
             bool alternativeJoyLayout{false};
+            // (fix194) The face buttons send the game the button printed on them (Touch A, B, X, Y: the game's A, B, X, Y), so its
+            // prompts name the button to press. Off: the old layout (right A = A, left X = B, right B = Y, left Y = X).
+            bool faceButtonsAsPrinted{true};
             bool decoupledPitch{false};
             bool pawnControl{true};
             // Shown body (ported from SFVR): the third-person body is drawn in first person, its arms
@@ -41,6 +44,20 @@ namespace GameFlow
             bool handTracking{true};    // finger joints from hand tracking when the runtime provides it
             bool realCrouch{false};     // bend the body when your real head goes below where you recentred
             bool crouchView{true};      // lower the view to the crouched body's eyes when crouching with the button
+            // (fix195) Weapon steadiness with the body shown:
+            // - tieViewToBody: in first person on foot the camera root is put where the body (and the gun in its hand) was placed this
+            //   frame, so the gun does not move against the view while you move (tracking::BeforeNodeUpdate).
+            // - lockGunGrip: how the hand holds each gun (and where the left hand's support grip is on it) is taken once it has held
+            //   still a moment and kept for that gun, instead of copying the hidden first-person rig's animation every frame; live
+            //   during a reload or a draw.
+            // - virtualStock: holding a gun with both hands, the gun hand near its shoulder, its aim line starts partly (up to 25%) from the
+            //   shoulder, which is steadier than the hand.
+            bool tieViewToBody{true};
+            bool lockGunGrip{true};
+            bool virtualStock{true};
+            // (fix199) Sitting in a seat the game shows with your own body: the view at that body's eyes, your head's lean from where you
+            // sat held softly past 15 cm, never past 30 cm (SeatView).
+            bool seatViewAtEyes{true};
             // Turning with the right stick (on foot): 0 = snap in fixed steps, 1 = smooth.
             int   turnMode{0};
             float snapTurnDegrees{45.0f};
