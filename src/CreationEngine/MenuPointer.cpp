@@ -82,6 +82,7 @@ namespace MenuPointer
             int      logs{ 0 };
         };
         StarZoom g_star_zoom{};
+        StarZoom g_chargen_zoom{}; // (fix203) character creation's, the same way (its wheel is the lists' scroll, not counted)
         // Placing (the game's cursor is where its mouse messages say the mouse is: mouse_override).
         constexpr float kPlacedNear     = 6.0f;                           // the cursor where it was put (the game's pixels)
         constexpr float kPlacedFar      = 30.0f;                          // and not there
@@ -1337,6 +1338,9 @@ namespace MenuPointer
         }
     }
 
+    // (fix203) The right stick's zoom in one place (the star map, character creation), its own count for the log (below; under g_mutex).
+    static void ZoomByStick(_XINPUT_GAMEPAD* pad, StarZoom& z, bool shown, bool chargen);
+
     void StarMapZoom(_XINPUT_GAMEPAD* pad)
     {
         // (fix175) The star map zoomed with the right stick. The game zooms its star map with the triggers (RT in, LT out) or the mouse wheel,
@@ -1346,18 +1350,33 @@ namespace MenuPointer
         // its push up is RT and down is LT, as far as the stick is pushed (a gamepad's triggers: the game stays in gamepad mode), only a push
         // mostly up or down; its left and right stay the game's turn, the up and down never reach the game there (no tilt by the stick).
         // Only while the star map is drawn this moment and is the menu shown (never into play, where RT fires).
+        // (fix203) Character creation the same way: the game zooms its character with LT and RT (the menu's own button handler: RT brings it
+        // nearer, the value starting at its farthest) and turns it with the right stick's left and right only (its up and down unused there).
+        // Pointing, the triggers are the clicks and the stick's up and down the lists' wheel; navigating with the left stick, the triggers
+        // choose; so no zoom at all before. Now, while you do not point, the right stick's up is RT (nearer) and down LT (farther).
         if (pad == nullptr) {
             return;
         }
         std::scoped_lock _{ g_mutex };
-        auto&      z     = g_star_zoom;
-        const bool shown = GameFlow::isStarMapShown(150) && GameFlow::isShowingMenu();
+        ZoomByStick(pad, g_star_zoom, GameFlow::isStarMapShown(150) && GameFlow::isShowingMenu(), false);
+        ZoomByStick(pad, g_chargen_zoom, GameFlow::isChargenShown(100) && GameFlow::isShowingMenu(), true); // (fix203: never into play)
+    }
+
+    static void ZoomByStick(_XINPUT_GAMEPAD* pad, StarZoom& z, bool shown, bool chargen)
+    {
+        // (Under g_mutex.)
         if (!shown) {
             if (z.shown && (z.wheel_in + z.wheel_out + z.push_in + z.push_out) > 0 && z.logs < 30) {
                 ++z.logs;
-                spdlog::info("[MenuPointer] (fix175) star map closed: the right stick zoomed in {} and out {} times (as the mouse wheel {} and {} "
-                             "notches while pointing at it; as RT and LT {} and {} pushes otherwise)",
-                    z.wheel_in + z.push_in, z.wheel_out + z.push_out, z.wheel_in, z.wheel_out, z.push_in, z.push_out);
+                if (chargen) {
+                    spdlog::info("[MenuPointer] (fix203) character creation closed: the right stick zoomed in {} and out {} times (as RT and LT, "
+                                 "while not pointing)",
+                        z.push_in, z.push_out);
+                } else {
+                    spdlog::info("[MenuPointer] (fix175) star map closed: the right stick zoomed in {} and out {} times (as the mouse wheel {} and {} "
+                                 "notches while pointing at it; as RT and LT {} and {} pushes otherwise)",
+                        z.wheel_in + z.push_in, z.wheel_out + z.push_out, z.wheel_in, z.wheel_out, z.push_in, z.push_out);
+                }
             }
             if (z.shown) {
                 const int logs = z.logs;

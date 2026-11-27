@@ -699,19 +699,28 @@ namespace HandActions
         // (The scanner under a menu, the pause menu over it: that menu's own controls. The star map is a menu: its own here.)
         // (fix175) Build mode too (no menu by the count: the pause menu over it has its own controls): LB and RB are its categories there
         // (the game's control map: Workshop context), and with the hand grab held off there the grips had nothing else to do.
+        // (fix203) Character creation too (a menu; a message box over it has no use for LB and RB): its tabs are on LB and RB. A grip's tap is
+        // put in the report after the menu pointer's filter, so it reaches the menu while you point at it or move through it with the left stick
+        // (both keep the thumbrests' LB and RB from the game, as in every menu); and a squeeze is meant, where a resting thumb is not.
         return (scanner && !GameFlow::isShowingMenu() && !g_scanner_closing.load()) || GameFlow::isStarMapShown(kModeWithinMs) ||
-               (GameFlow::isWorkshopShown(kModeWithinMs) && !GameFlow::isShowingMenu());
+               (GameFlow::isWorkshopShown(kModeWithinMs) && !GameFlow::isShowingMenu()) ||
+               (GameFlow::isChargenShown(300) && GameFlow::isShowingMenu()); // (fix203: 300 ms, a long frame drops no tap)
     }
 
     const char* GripsPlace()
     {
-        return GameFlow::isStarMapShown(kModeWithinMs) ? "star map" : GameFlow::isWorkshopShown(kModeWithinMs) ? "build mode" : "hand scanner";
+        return GameFlow::isStarMapShown(kModeWithinMs)   ? "star map"
+               : GameFlow::isWorkshopShown(kModeWithinMs) ? "build mode"
+               : GameFlow::isChargenShown(300)            ? "character creation" // (fix203)
+                                                          : "hand scanner";
     }
 
     bool LeftGripWaits()
     {
         // (The hand scanner's left grip stays at once: its LB closes it, and no combo of the left grip means anything there.)
-        return GameFlow::isStarMapShown(kModeWithinMs) || GameFlow::isWorkshopShown(kModeWithinMs);
+        // (fix203) Character creation's waits as the star map's: the left grip with the left trigger and the stick is the D-pad there, with the
+        // menu button View; such a combo is no LB.
+        return GameFlow::isStarMapShown(kModeWithinMs) || GameFlow::isWorkshopShown(kModeWithinMs) || GameFlow::isChargenShown(300);
     }
 
     bool GripIsShoulder(bool left) { return g_grip_shoulder[left ? 0 : 1].load(); }

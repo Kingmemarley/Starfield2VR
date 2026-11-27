@@ -39,6 +39,8 @@ namespace MenuPointer
     // (fix175, after StickSideways) The star map (drawn this moment): the right stick's up and down zoom whether you point or not: pointing
     // at it, the mouse wheel (FilterGamepad); otherwise its push sent as RT (up, in) or LT (down, out), as far as it is pushed. Logged with
     // the counts as the star map closes.
+    // (fix203) Character creation too, while you do not point (pointing, the stick's up and down are its lists' wheel): RT (up) brings the
+    // character nearer, LT (down) farther, as its own trigger zoom does.
     void StarMapZoom(_XINPUT_GAMEPAD* pad);
     // Each frame (the mod's frame): lets go of the button (and gives the cursor back) when the gamepad polls have stopped.
     void Watchdog();

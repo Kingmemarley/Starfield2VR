@@ -112,7 +112,7 @@ namespace GameFlow
             bool  dialoguePanel{true};     // (fix145) the conversation on a panel of its own, fixed in the room in front of the person speaking (ConversationPanel)
             bool  dialogueTouchPress{false}; // (fix173) ...its answers also pressed by pushing a finger into them (off: pointed at, the trigger pulled; the panel stays)
             bool  dialogueTurn{true};      // (fix173) in a conversation the right stick turns you smoothly, whatever the turn mode (the panel kept in front of the person)
-            bool  scannerGrips{true};      // (fix173) in the hand scanner and the star map (fix175: and build mode) a grip's squeeze taps LB (left) or RB (right); no grab or throw there
+            bool  scannerGrips{true};      // (fix173) in the hand scanner and the star map (fix175: and build mode; fix203: and character creation) a grip's squeeze taps LB (left) or RB (right); no grab or throw there
             bool  messagesBlock{true};     // (fix178) the game's messages (notifications, mission updates...) in one place below your view's middle, bigger (MessagesBlock)
             bool  buildConsole{true};      // (fix177) build mode as a console: its card, list, hints and footer low in front of your seat, its cards, warnings and notifications near your view's middle (BuildConsole)
             bool  menuStickNavigate{true}; // (fix146) the left stick navigates menus (the game's own), the pointer stepping aside meanwhile

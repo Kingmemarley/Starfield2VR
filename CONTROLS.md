@@ -29,6 +29,7 @@ Parts that have not been tested yet say so.
 - [Conversations](#conversations)
 - [Favorites wheel](#favorites-wheel)
 - [Star map](#star-map)
+- [Character creation](#character-creation)
 - [Build mode](#build-mode)
 - [The pilot's seat](#the-pilots-seat)
 - [Eye modes, flat screen and the mod's menu](#eye-modes-flat-screen-and-the-mods-menu)
@@ -379,6 +380,31 @@ The left grip's LB waits 0.15 s, so that a combo (trigger, menu button, stick cl
 
 ---
 
+## Character creation
+
+When a new game reaches character creation, it shows on the menu panel like other menus: the game's own picture of your
+character, in the game's 16:9 box, with a soft light around the panel. Point and click works as in any menu.
+
+| Input | What it does |
+| - | - |
+| Point and pull a trigger | Click: the tabs, the lists, the arrows, the sliders (hold the trigger and move to drag) |
+| Left thumbstick up / down | Move through the rows |
+| Left thumbstick left / right | Change the highlighted value, one step a push |
+| Left grip / right grip | LB / RB: the tab before / the next tab, whether you point or use the stick |
+| Left / right thumbrest | Nothing here (the tabs switch as the button is let go, so a resting thumb would switch them). With "The grips as LB and RB" off: LB / RB while you neither point nor use the left stick |
+| Right thumbstick left / right (while you do not point at the panel) | Turn your character |
+| Right thumbstick up / down (while you do not point at the panel) | Zoom in / out (the game's RT / LT). While you point: scroll |
+| Right **A** | Choose, open a face part, confirm |
+| Right **B** | Back |
+| Left **X** | Finish (then the name and pronouns) |
+| Right thumbstick click | On the Body tab: see the spacesuit |
+
+- Left and right on the stick always change the highlighted value (the game's own controls), so here they do not switch
+  tabs. Use the grips for that.
+- The name is typed with the PC's keyboard.
+
+---
+
 ## Build mode
 
 Ship decorating and outpost building. These are the buttons the mod sends for the game's own build-mode controls. Not
@@ -459,7 +485,7 @@ shoulder buttons on the triggers. Not tested yet.
 | Left grip + both triggers | Favorites wheel | LB + RB: your power |
 | D-pad | Left grip + left trigger + left thumbstick | Left grip + left thumbstick. Not while a left-hand weapon is held: that grip throws it |
 | Favorites wheel | On | Off: the game's own favorites menu |
-| Grips as LB / RB in the scanner, star map and build mode | On | Off |
+| Grips as LB / RB in the scanner, star map, build mode and character creation | On | Off |
 
 ---
 
@@ -518,7 +544,7 @@ here too".)
 | Left-handed (Swap Controller Inputs) | Off | See above |
 | Include AER in the eye-mode button | Off | On: the eye-mode button cycles stereo, mono and AER |
 | Flashlight and scanner at your temples | On | The left temple: the flashlight; the right: the hand scanner |
-| The grips as LB and RB in the scanner | On | Also the star map and build mode. Off: the grips grab as usual there |
+| The grips as LB and RB in the scanner | On | Also the star map, build mode and character creation. Off: the grips grab as usual there |
 | Impact melee / Hit the moment a swing connects | On / On | Swing to hit; swing speed 2.2 m/s |
 | Throw your melee weapon | On | Grip, swing, let go |
 | Aim throws at people | On | The throw flies at the person your hand points at |

@@ -678,6 +678,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         // as it comes, the review). The other button "out" means: not sent by the other thumbrest now, not in the last reports handed over
         // for kShoulderGap, no grip's tap of it running.
         const bool in_menu  = menu_now; // (fix194, the review: read once, above)
+        // (fix203) Character creation, its tabs on the grips: no thumbrest LB or RB there. It switches tabs as the button is let go, so a resting
+        // right thumb's held RB switched tabs as it lifted (to press A), as the pointer's filter or the stick's navigation took it away, or
+        // twice with a grip's tap (the review).
+        const bool chargen_tabs = grip_shoulders && GameFlow::isChargenShown();
         const bool rb_clear = in_menu || (!sh.rb_on && now - sh.rb_sent >= kShoulderGap && now >= sh.grip_until[1]);
         // The left thumbrest: LB tapped as the thumb touches it (fix158: not with the left grip squeezed: the thumb rests there as you hold or
         // throw the left weapon, and LB opened the scanner: the scanner was opening with the left grip; fix171: nor while the favorites
@@ -707,7 +711,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             // (fix175, the review: not in build mode: LB is its category there, the grips give it; a thumb resting there changed categories.)
             // (fix198) The gun's grip, held in both hands, counts as the grip here too: the thumb rests on the thumbrest as the hand holds the
             // gun, as it did holding the left weapon (fix158), and its touch would open the scanner while aiming.
-            const bool may   = !is_left_grip_down && !wheel.left_shoulder && !(GameFlow::isWorkshopShown() && !in_menu);
+            const bool may   = !is_left_grip_down && !wheel.left_shoulder && !(GameFlow::isWorkshopShown() && !in_menu) && !chargen_tabs; // (fix203)
             if (fresh) {
                 sh.lb_pending    = may && !sh.lb_after_menu;
                 sh.lb_pending_at = now;
@@ -789,7 +793,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                     ++sh.scanner_logs;
                     spdlog::info("[Buttons] (fix173) the right thumbrest touched in the hand scanner: no RB (its surface map) until the thumb leaves it");
                 }
-                if (GameFlow::isScannerOpen() || grenade_button_owned || wheel.right_shoulder || (GameFlow::isWorkshopShown() && !in_menu)) { // (fix175: nor in build mode)
+                if (GameFlow::isScannerOpen() || grenade_button_owned || wheel.right_shoulder || (GameFlow::isWorkshopShown() && !in_menu) ||
+                    chargen_tabs) { // (fix175: nor in build mode; fix203: nor in character creation, its tabs on the grips)
                     sh.rb_cut = true;
                 }
                 if (sh.rb_cut) {
@@ -1221,5 +1226,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     GameFlow::noteButtonsSent(pXinputGamepad->wButtons);
     // (fix175) And for build mode's log.
     GameFlow::noteWorkshopPad(pXinputGamepad->wButtons, pXinputGamepad->bLeftTrigger, pXinputGamepad->bRightTrigger);
+    // (fix203) And for character creation's.
+    GameFlow::noteChargenPad(pXinputGamepad->wButtons, pXinputGamepad->bLeftTrigger, pXinputGamepad->bRightTrigger, pXinputGamepad->sThumbLX,
+        pXinputGamepad->sThumbLY, pXinputGamepad->sThumbRX, pXinputGamepad->sThumbRY);
 }
 

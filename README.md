@@ -290,7 +290,7 @@ Some defaults worth knowing:
 | Powers by pushing your palm | On (1.5 m/s) | F11 > Advanced > Aiming, powers and grenades |
 | Grenades from your shoulder | On | F11 > Advanced > Aiming, powers and grenades |
 | Gun sight, with its laser | On | F11 > Advanced > Aiming, powers and grenades |
-| The grips as LB and RB in the scanner (also the star map and build mode) | On | F11 > Advanced > Conversations, the scanner and menus |
+| The grips as LB and RB in the scanner (also the star map, build mode and character creation) | On | F11 > Advanced > Conversations, the scanner and menus |
 | Recenter after loading screens | On | Settings > VR |
 | HUD size | 40% | Settings > VR |
 

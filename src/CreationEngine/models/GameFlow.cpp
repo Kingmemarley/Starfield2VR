@@ -75,6 +75,7 @@ namespace GameFlow
         std::atomic<int64_t> g_fullscreen_run_ms{-100000};  // (fix159) since when they have been drawn without a gap
         std::atomic<int64_t> g_last_slate_ms{-100000};      // (fix173) the slate's own movie last set up (each frame while it is open)
         std::atomic<int64_t> g_last_workshop_ms{-100000};   // (fix175) build mode's movie last set up (each frame while it is open)
+        std::atomic<int64_t> g_last_chargen_ms{-100000};    // (fix203) character creation's movie last set up (each frame while it is open)
 
         int64_t now_ms() {
             return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -265,6 +266,15 @@ namespace GameFlow
         // held back from the game; the review.)
         case "Interface/BookMenu.swf"_DJB:
         case "Interface/BookMenu_LRG.swf"_DJB:
+        // (fix203) Character creation (a new game, after the chargen bench). The game draws it in its 16:9 box, and the character in it with a
+        // camera of its own (UI_CharGenPlayerRenderer, the game's 16:9 lens), not the world through the head's camera. In none of these lists
+        // before, it reached the panel only by the old rule that no HUD drawn is a menu: no box of its own (the game's box taken by the safety
+        // net), and a message box over it ("Select a background to continue.") was then the only menu counted, a see-through one: the world
+        // was drawn from the headset's camera around a stretched, see-through character (the first test's pictures). Counted now: on the
+        // panel, opaque (not in the see-through list, so nothing over it makes it see-through), in its own 16:9 box; and as a menu drawn (before,
+        // every thumbrest touch was taken for a thumb coming back as a menu closed). Its tabs are on the grips (HandActions::GripsAreShoulders).
+        case "Interface/ChargenMenu.swf"_DJB:
+        case "Interface/ChargenMenu_LRG.swf"_DJB:
             return true;
         default:
             return false;
@@ -667,6 +677,9 @@ namespace GameFlow
         if (hash == "Interface/WorkshopMenu.swf"_DJB || hash == "Interface/WorkshopMenu_LRG.swf"_DJB) {
             g_last_workshop_ms = now_ms(); // (fix175)
         }
+        if (hash == "Interface/ChargenMenu.swf"_DJB || hash == "Interface/ChargenMenu_LRG.swf"_DJB) {
+            g_last_chargen_ms = now_ms(); // (fix203)
+        }
         if (isSlateButtonsAlone(hash)) {
             // (fix173: the slate's buttons without the slate: counted neither way.)
         } else if (isHudMovieHash(hash)) {
@@ -900,6 +913,10 @@ namespace GameFlow {
     bool isFullscreenMenuDrawnWithin(int withinMs) {
         return now_ms() - g_fullscreen_last_ms.load() < withinMs; // (fix194)
     }
+
+    bool isChargenShown(int withinMs) {
+        return now_ms() - g_last_chargen_ms.load() < withinMs; // (fix203)
+    }
 }
 
 namespace GameFlow {
@@ -992,6 +1009,104 @@ namespace GameFlow {
         w.rt += rt && !w.rt_was;
         w.lt_was = lt;
         w.rt_was = rt;
+    }
+}
+
+namespace GameFlow {
+    namespace {
+        // (fix203) Character creation's own log, as build mode's: what the game got while it was open (each press counted, the triggers past the
+        // game's 30, each stick push past half way by its main direction), to see in a test whether its tabs, rows, values and the turn of the
+        // character were reached.
+        struct ChargenPad {
+            bool     open{ false };
+            int64_t  since_ms{ 0 };
+            uint16_t was{ 0 };
+            bool     lt_was{ false }, rt_was{ false };
+            int      left_dir_was{ 0 }, right_dir_was{ 0 }; // (0 none, 1 left, 2 right, 3 up, 4 down)
+            uint32_t a{ 0 }, b{ 0 }, x{ 0 }, y{ 0 }, lb{ 0 }, rb{ 0 }, lt{ 0 }, rt{ 0 }, up{ 0 }, down{ 0 }, left{ 0 }, right{ 0 }, view{ 0 }, start{ 0 };
+            uint32_t ls[5]{}, rs[5]{};
+            int      logs{ 0 };
+        };
+        ChargenPad g_chargen_pad{}; // (the gamepad poll's own)
+
+        int StickDir(int16_t sx, int16_t sy) {
+            const int x = sx, y = sy;
+            if (std::abs(x) < 16384 && std::abs(y) < 16384) {
+                return 0;
+            }
+            return std::abs(x) >= std::abs(y) ? (x < 0 ? 1 : 2) : (y > 0 ? 3 : 4);
+        }
+    }
+
+    void noteChargenPad(uint16_t buttons, uint8_t leftTrigger, uint8_t rightTrigger, int16_t leftX, int16_t leftY, int16_t rightX, int16_t rightY) {
+        auto&      c    = g_chargen_pad;
+        const bool open = isChargenShown() && isShowingMenu();
+        const auto now  = now_ms();
+        if (open && !c.open) {
+            const int logs = c.logs;
+            c              = ChargenPad{};
+            c.logs         = logs;
+            c.open         = true;
+            c.since_ms     = now;
+            c.was          = buttons; // (what is already held as it opens is no press in it)
+            c.lt_was       = leftTrigger > 30;
+            c.rt_was       = rightTrigger > 30;
+            c.left_dir_was  = StickDir(leftX, leftY);
+            c.right_dir_was = StickDir(rightX, rightY);
+            if (c.logs < 20) {
+                ++c.logs;
+                spdlog::info("[Chargen] (fix203) character creation open: a full-screen menu on the panel, opaque, in its own 16:9 box; the left stick "
+                             "and the D-pad move through it as on a gamepad; LB and RB (its tabs) {}; while you do not point, the right stick turns the character (left, right) and "
+                             "zooms (up RT, down LT)",
+                    gStore.internalSettings.scannerGrips && !gStore.internalSettings.alternativeJoyLayout
+                        ? "from the grips (not the thumbrests there)"
+                        : "from the thumbrests while you neither point nor move the stick (not the grips: ScannerGrips off or the alternative layout)");
+            }
+            return;
+        }
+        if (!open && c.open) {
+            c.open = false;
+            if (c.logs < 20) {
+                ++c.logs;
+                spdlog::info("[Chargen] (fix203) character creation closed ({:.1f} s; buttons sent: A {}, B {}, X {}, Y {}, LB {}, RB {}, LT {}, RT {}, D-pad "
+                             "up {} down {} left {} right {}, View {}, Start {}; the left stick pushed left {} right {} up {} down {}; the right stick "
+                             "left {} right {} up {} down {})",
+                    (now - c.since_ms) / 1000.0, c.a, c.b, c.x, c.y, c.lb, c.rb, c.lt, c.rt, c.up, c.down, c.left, c.right, c.view, c.start, c.ls[1],
+                    c.ls[2], c.ls[3], c.ls[4], c.rs[1], c.rs[2], c.rs[3], c.rs[4]);
+            }
+            return;
+        }
+        if (!open) {
+            return;
+        }
+        const uint16_t pressed = static_cast<uint16_t>(buttons & ~c.was);
+        c.was                  = buttons;
+        c.a += (pressed & XINPUT_GAMEPAD_A) != 0;
+        c.b += (pressed & XINPUT_GAMEPAD_B) != 0;
+        c.x += (pressed & XINPUT_GAMEPAD_X) != 0;
+        c.y += (pressed & XINPUT_GAMEPAD_Y) != 0;
+        c.lb += (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+        c.rb += (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+        c.up += (pressed & XINPUT_GAMEPAD_DPAD_UP) != 0;
+        c.down += (pressed & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+        c.left += (pressed & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+        c.right += (pressed & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+        c.view += (pressed & XINPUT_GAMEPAD_BACK) != 0;
+        c.start += (pressed & XINPUT_GAMEPAD_START) != 0;
+        const bool lt = leftTrigger > 30, rt = rightTrigger > 30;
+        c.lt += lt && !c.lt_was;
+        c.rt += rt && !c.rt_was;
+        c.lt_was = lt;
+        c.rt_was = rt;
+        const int ld = StickDir(leftX, leftY), rd = StickDir(rightX, rightY);
+        if (ld != 0 && ld != c.left_dir_was) {
+            ++c.ls[ld];
+        }
+        if (rd != 0 && rd != c.right_dir_was) {
+            ++c.rs[rd];
+        }
+        c.left_dir_was  = ld;
+        c.right_dir_was = rd;
     }
 }
 

@@ -1062,7 +1062,7 @@ void CreationEngineEntry::on_draw_advanced_ui(int part)
             changed |= m_scanner_plain->draw("A plain hand scanner");
             hint("Without the blue tint, the visor frame and the dark edges (only its circles and text).");
             changed |= m_scanner_grips->draw("The grips as LB and RB in the scanner");
-            hint("The hand scanner, the star map and build mode: the left grip taps LB, the right RB (no grab or throw there).");
+            hint("The hand scanner, the star map, build mode and character creation: the left grip taps LB, the right RB (no grab or throw there).");
             changed |= m_build_console->draw("Build mode as a console");
             hint("The item card, the list, the button hints and the outpost's footer on panels low in front of you; the action cards and "
                  "warnings near the middle of your view (off: all in your view as before).");

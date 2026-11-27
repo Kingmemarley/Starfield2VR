@@ -55,7 +55,7 @@ deleting the mod's settings and logs (the `sfvr` folder).
    "%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe" installer\Starfield2VR.iss
    ```
 
-   The output is `build\installer\Starfield2VR-Setup-1.1.1.exe`.
+   The output is `build\installer\Starfield2VR-Setup-1.1.2.exe`.
 
 Options (`/D` on the ISCC command line):
 
@@ -73,8 +73,8 @@ The `dxgi.dll`'s hash is built into the installer, so compile again after rebuil
 ## Command line
 
 ```
-Starfield2VR-Setup-1.1.1.exe /VERYSILENT /NORESTART /INSTALLTYPE=genesis /TARGET="C:\Star Wars Genesis\Game" /VCREDIST
-Starfield2VR-Setup-1.1.1.exe /VERYSILENT /NORESTART /INSTALLTYPE=steam /TARGET="C:\Program Files (x86)\Steam\steamapps\common\Starfield"
+Starfield2VR-Setup-1.1.2.exe /VERYSILENT /NORESTART /INSTALLTYPE=genesis /TARGET="C:\Star Wars Genesis\Game" /VCREDIST
+Starfield2VR-Setup-1.1.2.exe /VERYSILENT /NORESTART /INSTALLTYPE=steam /TARGET="C:\Program Files (x86)\Steam\steamapps\common\Starfield"
 ```
 
 | Parameter | |

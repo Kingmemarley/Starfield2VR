@@ -129,6 +129,9 @@ namespace GameFlow {
     bool isScannerDrawnWithin(int withinMs);
     // (fix194) A full-screen menu (not the cursor) drawn within this long: a menu still counted as shown with none drawn lately is closing.
     bool isFullscreenMenuDrawnWithin(int withinMs);
+    // (fix203) Character creation (Interface/ChargenMenu.swf) set up within this long: a full-screen menu shown opaque on the panel (its own
+    // 16:9 box), the grips LB and RB there (HandActions::GripsAreShoulders), the soft light round the panel instead of the world as it was.
+    bool isChargenShown(int withinMs = 300);
     // (fix157) The favorites menu (Interface/FavoritesMenu.swf, drawn in the HUD layer: not a menu by the count) drawn within the last 0.3 s.
     bool isFavoritesShown();
     // (fix175) Build mode (Interface/WorkshopMenu.swf: ship decorating, outpost building; a HUD-like screen, not a menu by the count, the world
@@ -137,6 +140,9 @@ namespace GameFlow {
     bool isWorkshopShown(int withinMs = 300);
     // (fix175) Build mode's log (each gamepad poll, with what the game gets): "[Workshop] build mode open/closed" with the buttons sent.
     void noteWorkshopPad(uint16_t buttons, uint8_t leftTrigger, uint8_t rightTrigger);
+    // (fix203) Character creation's log (each gamepad poll, with what the game gets): "[Chargen] character creation open/closed" with the buttons
+    // and stick pushes sent while it was open (did LB and RB, the D-pad and the sticks reach it).
+    void noteChargenPad(uint16_t buttons, uint8_t leftTrigger, uint8_t rightTrigger, int16_t leftX, int16_t leftY, int16_t rightX, int16_t rightY);
     // (fix165) The buttons the mod hands to the game (each press counted, START's last time), for the seat log: the pilot's seat where
     // nothing could be done, not even a pause.
     struct ButtonsSent {

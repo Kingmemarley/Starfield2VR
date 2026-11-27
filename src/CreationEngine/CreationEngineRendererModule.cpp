@@ -149,6 +149,42 @@ namespace
         }
     }
 
+    // (fix203) Character creation on the panel: how it is shown, from its 30th frame (the box and the menus settled), and again at each change
+    // while it stays open (a message box over it must change nothing: before, it made the panel see-through with the world drawn from your
+    // head). Once a frame, at the frame's start; 40 lines a session at most.
+    void WatchChargenPanel()
+    {
+        static bool        open   = false;
+        static int         frames = 0;
+        static int         logs   = 0;
+        static std::string last{};
+        const auto&        s = ModSettings::g_internalSettings;
+        if (!s.showQuadDisplay || !GameFlow::isChargenShown()) {
+            open   = false;
+            frames = 0;
+            last.clear();
+            return;
+        }
+        if (!open) {
+            open   = true;
+            frames = 0;
+        }
+        if (++frames < 30 || logs >= 40) {
+            return;
+        }
+        const auto        backbuffer = VR::get()->get_backbuffer_size();
+        const std::string state =
+            std::format("see-through {}, the world kept drawn behind it {}, the frame kept full size {}, its box {} of {} rows, round the panel {}",
+                s.menuSeeThrough ? "yes" : "no", LiveWorld::Active() ? "yes" : "no", FullFrame::Active() ? "yes" : "no", s.menuBoxRows,
+                (int)backbuffer[1], s.menuGlowWhenEmpty ? "the soft light" : s.menuWorldBehind ? "the world as it was" : "no world");
+        if (state != last) {
+            ++logs;
+            spdlog::info("[Chargen] (fix203) character creation on the panel{}: {} (the menus shown: {})", last.empty() ? "" : " (changed)", state,
+                GameFlow::shownMenus());
+            last = state;
+        }
+    }
+
     // (fix173) Sudden drops of the frame rate (it dropped hard, then came back, while playing in one area): each second's frame
     // rate against the 10 s before it; a second under 60% of those logged with what may explain it: its frame times, the video memory, the
     // eyes' mode, a menu or loading screen, the physics update's time. At most a line each 10 s, 60 a session; nothing else done. (At the
@@ -465,7 +501,10 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
         ModSettings::g_internalSettings.menuLoadingScreen = ModSettings::g_internalSettings.showQuadDisplay && GameFlow::isLoadingScreenShown(); // (fix164)
         // (fix183) Black showed outside the background when the surface map and the star map opened: that black now has
         // the glow, as loading screens do.
-        ModSettings::g_internalSettings.menuGlowWhenEmpty = ModSettings::g_internalSettings.showQuadDisplay && GameFlow::isStarMapShown();
+        // (fix203) And character creation: the world as it was behind it is the last frame before it opened (the game's black fade, or the room
+        // from where your head was), nothing to do with the character shown; the soft light in the menu's own colours instead.
+        ModSettings::g_internalSettings.menuGlowWhenEmpty =
+            ModSettings::g_internalSettings.showQuadDisplay && (GameFlow::isStarMapShown() || GameFlow::isChargenShown());
         {
             const auto backbuffer = vr->get_backbuffer_size();
             int        rows       = ModSettings::g_internalSettings.showQuadDisplay ? GameFlow::menuBoxRows((int)backbuffer[0], (int)backbuffer[1]) : 0;
@@ -486,6 +525,7 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
         }
         WatchTallPanel(drawn_before); // (fix192)
         WatchFrameRate(); // (fix173)
+        WatchChargenPanel(); // (fix203)
     } else if (!before && m_framePass == pGraph) {
         auto fc          = GameFlow::renderLoopFrameCount();
         auto context     = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(pRenderGraphData->getCommandList());
