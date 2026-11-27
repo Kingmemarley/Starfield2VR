@@ -74,6 +74,13 @@ namespace body
         // (fix189) The next root's first update owes the put-back (the shown body hidden, the arms shown) that the off switch would have
         // done: the body was turned off while the player had no third-person root (nothing could be touched then).
         bool g_put_back_owed{ false };
+        // (fix202) When the switch hook (OnPlayerSwitch, below) last put the bodies as the game has them in first person, for the game's own
+        // turn to third person (steady clock, ms; 0 never). The shown body is not put back on another thread for a moment after it.
+        std::atomic<int64_t> g_switch_fixed_ms{ 0 };
+        constexpr int64_t    kSwitchHoldMs = 300;
+        // (fix202) The player's +0x112A: bit 3 (value 8) is the game's "third person" mark, set by its turn to third person and by its own
+        // body-in-a-seat view (0x141A41950).
+        constexpr std::size_t kPlayerViewMark = 0x112A;
         std::atomic<RE::NiAVObject*> g_body_muzzle{ nullptr };
         // (fix189) The engine frame the muzzle was last found in (PrepareFrame, under the weapon in your hands), and whether it is a
         // different node from the one kept before. Other threads take it only if it was found this frame or the last: the pointer is not
@@ -207,6 +214,21 @@ namespace body
             return valid ? first_person : nullptr;
         }
 
+        int64_t SteadyMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        // (fix202) The game's "third person" mark (read under a guard; false if it cannot be read).
+        bool GameThirdPersonMark(RE::PlayerCharacter* player)
+        {
+            __try {
+                return player != nullptr && (*(reinterpret_cast<const uint8_t*>(player) + kPlayerViewMark) & 8) != 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
         // Called when the 3P root updates, before its skeleton.
         void UpdateVisibility(RE::PlayerCharacter* player, RE::NiAVObject* root)
         {
@@ -219,17 +241,31 @@ namespace body
                 // (fix189) Its model node read now, while the root updates (each time: the hook compares with this one).
                 g_state.model    = *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(root) + kModelNodeOffset);
                 g_put_back_owed  = false;
-                SetAppCulled(root, false);
-                SetAppCulled(first_person, true);
-                SetAppCulled(FaceNode(player), true);
+                // (fix202) Just after the switch hook put the bodies as in first person for the game's turn to third person, they are left
+                // as they are a moment: showing the body again on this thread before the game has read them would make it take the player
+                // for already in third person again (no swap of the bodies and animations). Read right before the culls.
+                if (SteadyMs() - g_switch_fixed_ms.load() >= kSwitchHoldMs) {
+                    SetAppCulled(root, false);
+                    SetAppCulled(first_person, true);
+                    SetAppCulled(FaceNode(player), true);
+                }
                 g_state.active = true;
             } else if (g_state.active || g_put_back_owed) { // (fix189: or owed by a body turned off with no root)
                 g_put_back_owed = false;
                 g_body_muzzle = nullptr;
                 g_view_offset = 0.0f;
-                if (GameFlow::isInFirstPerson()) {
+                // (fix202) Not with the game's third-person mark set: the game has its own bodies then (third person, a seat that turns
+                // the player to third person with the camera still in first person, or its own body-in-a-seat view), and hiding its
+                // body and showing the arms would leave it drawing the arms on a third-person player.
+                const bool game_third = GameThirdPersonMark(player);
+                if (GameFlow::isInFirstPerson() && !game_third) {
                     SetAppCulled(root, true);
                     SetAppCulled(first_person ? first_person : FirstPersonRoot(player), false);
+                }
+                static std::atomic<int> kept_told{ 0 };
+                if (game_third && GameFlow::isInFirstPerson() && kept_told.fetch_add(1) < 20) {
+                    spdlog::info("[Body] (fix202) the body off with the game's third-person mark set (camera in first person): the game's own "
+                                 "bodies left as it has them");
                 }
                 SetAppCulled(FaceNode(player), false);
                 g_state.active = false;
@@ -6205,6 +6241,13 @@ namespace body
         // in third person, no climb). So, just before it, the bodies as the game has them in first person (the shown body hidden, the
         // arms shown): it then does the whole switch itself. (The shown body is not put back meanwhile: it is only shown in first
         // person.)
+        // (fix202) Every turn to third person, not only a ladder's. A new game stopped before character creation: the quest snaps the
+        // player into the character-creation bench (a seat marked "third person only"), the game turns the player to third person for
+        // its animations, the shown body made that turn do nothing, the seat was refused, and the scene waited for the player to sit
+        // with the screen held black. Going to first person the game swaps the bodies itself whenever the first-person body is hidden
+        // (refused only for some player states, leaving the mark set), or starts its own body-in-a-seat view in a seat, so only the
+        // turn to third person needs it. Still only with the game's third-person mark clear (BodiesMixed): real third person
+        // and the game's own seat view are left alone. Each call logged (capped) with its caller.
         constexpr uintptr_t kSwitchRva    = 0x1A41D50;
         constexpr uint8_t   kSwitchBytes[] = { 0x88, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x53, 0x56, 0x57 };
         safetyhook::MidHook g_switch_hook{};
@@ -6235,25 +6278,88 @@ namespace body
             }
         }
 
+        // (fix202) What the log tells of each call: who called (the return address), the sit state (+0xFC bits 11-12: 0 none, 1 getting
+        // in, 2 sitting or lying, 3 getting up), the third-person mark (+0x112A), the game's seat-rig flag (+0x112F bit 3, its own
+        // body-in-a-seat view) and which body was hidden (-1: none there). Read under a guard.
+        struct SwitchFacts
+        {
+            uintptr_t ret{ 0 };
+            uint32_t  state2{ 0 };
+            uint8_t   mark{ 0 };
+            uint8_t   seat_rig{ 0 };
+            int       first_hidden{ -1 };
+            int       third_hidden{ -1 };
+        };
+
+        bool ReadSwitchFacts(RE::PlayerCharacter* player, uintptr_t rsp, SwitchFacts& f)
+        {
+            __try {
+                f.ret             = *reinterpret_cast<const uintptr_t*>(rsp);
+                const auto* bytes = reinterpret_cast<const uint8_t*>(player);
+                f.state2          = *reinterpret_cast<const uint32_t*>(bytes + 0xFC);
+                f.mark            = bytes[kPlayerViewMark];
+                f.seat_rig        = bytes[0x112F];
+                const auto* first = FirstPersonRoot(player);
+                const auto* third = ThirdPersonRoot(player);
+                f.first_hidden    = first != nullptr ? (IsAppCulled(first) ? 1 : 0) : -1;
+                f.third_hidden    = third != nullptr ? (IsAppCulled(third) ? 1 : 0) : -1;
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
         void OnPlayerSwitch(safetyhook::Context& ctx)
         {
             auto* player = CreationEngineSingletonManager::GetPlayerRef();
-            // (Only for a ladder activated a moment ago: other turns to third person, a seat's, the pilot's, photo mode, are left as they
-            // were, untested otherwise; the review.)
-            if (player == nullptr || ctx.rcx != reinterpret_cast<uintptr_t>(player) || (ctx.rdx & 0xFF) != 0 || !LadderClimb::ActivatedRecently()) {
+            if (player == nullptr || ctx.rcx != reinterpret_cast<uintptr_t>(player)) {
                 return;
             }
+            const bool  to_third = (ctx.rdx & 0xFF) == 0;
+            const bool  shown    = g_state.active.load();
+            SwitchFacts facts{};
+            const bool  read  = ReadSwitchFacts(player, ctx.rsp, facts);
             RE::NiAVObject* first = nullptr;
             RE::NiAVObject* third = nullptr;
-            if (!BodiesMixed(player, first, third)) {
-                return;
+            // (fix202: any turn to third person; fix146 only a ladder's.)
+            const bool fixed = to_third && BodiesMixed(player, first, third);
+            if (fixed) {
+                // (Noted first: the body's own update, on another thread, then leaves the bodies alone until the game has swapped them.)
+                g_switch_fixed_ms.store(SteadyMs());
+                SetAppCulled(third, true);
+                SetAppCulled(first, false);
+                g_switch_fixes.fetch_add(1);
             }
-            SetAppCulled(third, true);
-            SetAppCulled(first, false);
-            if (g_switch_fixes.fetch_add(1) < 20) {
-                spdlog::info("[Body] the game turns you to third person with the shown body up: the bodies put as in first person first, so the "
-                             "game swaps them and its animations itself (thread {})",
-                    GetCurrentThreadId());
+            // (Separate caps: the turns the hook acted on are never crowded out by the others.)
+            static std::atomic<int> lines{ 0 };
+            static std::atomic<int> fixed_lines{ 0 };
+            if (fixed ? fixed_lines.fetch_add(1) < 40 : lines.fetch_add(1) < 80) {
+                const char* what = !read   ? "its state could not be read"
+                                   : fixed ? "the shown body up: the bodies put as in first person, so the game swaps them and its animations "
+                                             "to third person itself"
+                                   : !to_third
+                                       ? "left to the game: going to first person it swaps the bodies itself whenever the first-person body "
+                                         "is hidden (refused only for some player states, leaving the mark set), or starts its own "
+                                         "body-in-a-seat view in a seat"
+                                   : (facts.mark & 8) != 0
+                                       ? "left as they are: the game's third-person mark already set (third person, or its own "
+                                         "body-in-a-seat view)"
+                                       : "the bodies as the game has them: it swaps them itself";
+                const auto base = reinterpret_cast<uintptr_t>(MemoryScan::mod);
+                spdlog::info("[Body] (fix202) the game turns you to {} person (called from rva {:x}): the shown body {}, sit state {}, the "
+                             "third-person mark {} (+0x112A {:02x}), its seat view {}, the first-person body {}, the third-person body {}, the "
+                             "camera in first person {}, a ladder just activated {}: {} (thread {})",
+                    to_third ? "third" : "first", facts.ret > base ? facts.ret - base : 0, shown ? "up" : "off", (facts.state2 >> 11) & 3u,
+                    (facts.mark >> 3) & 1, facts.mark, (facts.seat_rig >> 3) & 1,
+                    facts.first_hidden < 0 ? "missing" : facts.first_hidden ? "hidden" : "shown",
+                    facts.third_hidden < 0 ? "missing" : facts.third_hidden ? "hidden" : "shown", GameFlow::isInFirstPerson(),
+                    LadderClimb::ActivatedRecently(), what, GetCurrentThreadId());
+            }
+            // (The review) Put as in first person once more just before the game reads them: the body's update on another thread may have
+            // shown the body between the first time and now.
+            if (fixed && (!IsAppCulled(third) || IsAppCulled(first))) {
+                SetAppCulled(third, true);
+                SetAppCulled(first, false);
             }
         }
     }
@@ -6267,7 +6373,9 @@ namespace body
         }
         g_switch_hook = safetyhook::create_mid(reinterpret_cast<void*>(At(kSwitchRva)), &OnPlayerSwitch);
         spdlog::info("[Body] the game's first/third-person switch (rva {:x}) {}", kSwitchRva,
-            g_switch_hook ? "hooked: the bodies put as in first person before a turn to third person" : "could not be hooked");
+            g_switch_hook ? "hooked: the bodies put as in first person before any turn to third person with the shown body up (fix202: not "
+                            "only a ladder's)"
+                          : "could not be hooked");
     }
 
     bool RightBladeLocal(glm::vec3& way)

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 #include <format>
 #include <fstream>
 #include <utility>
@@ -140,6 +141,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         m_aer.pose_valid[0] = m_aer.pose_valid[1] = false; // (AER again: each eye's pose from its first picture then)
     }
     const bool openxr_ready = runtime->is_openxr() && vr->m_openxr->ready();
+    // (fix201) The diagnostics after a loading screen: how long ago it ended, for this present's end of frame (the layers' lines).
+    if (runtime->is_openxr() && vr->m_openxr != nullptr) {
+        vr->m_openxr->diag_since_load_ms = vr->diag_ms_since_load();
+        vr->m_openxr->diag_load          = vr->m_diag_loads.load();
+    }
     // (This present's own submit poses and AER mark only: a frame that could not be ended leaves none behind, fix136's review.)
     if (runtime->is_openxr()) {
         vr->m_openxr->submit_valid = false;
@@ -881,6 +887,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
+    // (fix201) The diagnostics' pictures after a loading screen (every 10 s for 90 s; nothing waited for), once a headset frame.
+    if (openxr_ready && (mono || native || aer || present_eye == VRRuntime::Eye::RIGHT)) {
+        diag_pictures(vr, eye_texture.Get(), native,
+            panel ? "shown as mono with a menu's panel up" : native ? "full stereo" : mono ? "mono" : aer ? "AER" : "taking turns", command_queue);
+    }
+
     // The strip of small pictures (the gun sight's, the menu panel's veil, beam and dot), made the first time it is shown:
     // copied into the runtime's images as the eye pictures just were, at the same point of the frame (begun, the eye images
     // filled).
@@ -1025,6 +1037,12 @@ void D3D12Component::on_reset(VR* vr) {
     
     m_prev_backbuffer.Reset();
     m_backbuffer_copy.reset();
+    // (fix201) The diagnostics' copies done first: one may read the converted picture let go just below.
+    for (auto& k : m_diag.kinds) {
+        if (k.commands_ready) {
+            k.commands.wait(INFINITE);
+        }
+    }
     m_converted_eye_tex.reset();
     m_world_history.clear(); // (its textures are made anew)
     // (The see-through picture and its views of the interface layer: made anew; the layer's copy is the game side's to replace.)
@@ -5224,6 +5242,184 @@ bool D3D12Component::present_native_left(uint32_t frame) {
         N.kept_pose = fp.stage[0];
     }
     return true;
+}
+
+// (fix201) See m_diag. Called on the present thread once each present has its eye pictures made (on_frame).
+void D3D12Component::diag_pictures(VR* vr, ID3D12Resource* game_picture, bool native, const char* eyes, ID3D12CommandQueue* queue) {
+    auto&          D     = m_diag;
+    const int64_t  since = vr->diag_ms_since_load();
+    const uint32_t load  = vr->m_diag_loads.load();
+    if (since < 0) {
+        return;
+    }
+    if (load != D.load) {
+        D.load      = load;
+        D.last_tick = -1;
+    }
+    const int tick = since < 1000 ? -1 : (int)((since - 1000) / 10000); // (at 1 s, 11 s ... 81 s)
+    if (tick < 0 || tick <= D.last_tick || tick > 8 || queue == nullptr) {
+        return;
+    }
+    D.last_tick = tick;
+    if (m_mem_over_since_ms.load() != 0) {
+        spdlog::info("[Diag] (fix201) no pictures at {:.1f} s after loading screen {} ended: video memory over its budget", since / 1000.0, load);
+        return;
+    }
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    if (device == nullptr) {
+        return;
+    }
+    const uint32_t n = D.ring++ % 10;
+    // The interface layer's copy shown last (MenuLayer: its copy each frame a see-through menu is up or full stereo draws the left eye).
+    ComPtr<ID3D12Resource> ui{};
+    {
+        std::scoped_lock _{m_menu_layer.mtx};
+        const int slot = m_menu_layer.current;
+        if (slot >= 0 && slot < (int)m_menu_layer.slots.size() && std::chrono::steady_clock::now() - m_menu_layer.at < std::chrono::milliseconds(500)) {
+            ui = m_menu_layer.slots[slot].copy;
+        }
+    }
+    ComPtr<ID3D12Resource> left{};
+    if (native && m_native.left.texture != nullptr) {
+        left = m_native.left.texture;
+    }
+    // (The game's picture converted by the mod (a backbuffer of more than 8 bits): kept with the rest. Never the backbuffer itself: a
+    // reference held on it would make the game's resize fail.)
+    ComPtr<ID3D12Resource> game_keep{};
+    if (game_picture != nullptr && game_picture == m_converted_eye_tex.texture.Get()) {
+        game_keep = m_converted_eye_tex.texture;
+    }
+    struct Source {
+        const char*            what;
+        ID3D12Resource*        res;
+        ComPtr<ID3D12Resource> keep; // (the mod's own pictures kept by the saving thread until its copy is made; not the game's)
+    };
+    const Source sources[3]{
+        {"left", left.Get(), left},
+        {"game", game_picture, game_keep},
+        {"ui", ui.Get(), ui},
+    };
+    std::string notes{};
+    for (int i = 0; i < 3; ++i) {
+        auto&       k = D.kinds[i];
+        const auto& s = sources[i];
+        const auto  note = [&](const std::string& text) { notes += std::format("{}{} {}", notes.empty() ? "" : ", ", s.what, text); };
+        if (s.res == nullptr) {
+            note(i == 0 ? "none (not full stereo: the game's picture is both eyes)" : "none (no copy of the interface layer in the last half second)");
+            continue;
+        }
+        if (k.busy->load()) {
+            note("skipped (its last save still running)");
+            continue;
+        }
+        const auto desc = s.res->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1) {
+            note("skipped (not a plain picture)");
+            continue;
+        }
+        DXGI_FORMAT format = desc.Format;
+        if (format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        } else if (format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+            format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        }
+        if (!k.commands_ready) {
+            k.commands_ready = k.commands.setup(L"Diagnostics: a picture's copy");
+            if (!k.commands_ready) {
+                note("skipped (no command list)");
+                continue;
+            }
+        }
+        // (Its last copy long done: the save that followed it has finished. Not waited for if not, only skipped.)
+        if (k.commands.fence != nullptr && k.commands.fence->GetCompletedValue() < k.commands.fence_value) {
+            note("skipped (its last copy not done)");
+            continue;
+        }
+        // The mod's picture the copy goes into: made for this save alone, its only reference then the saving thread's (no video memory held
+        // between saves).
+        ComPtr<ID3D12Resource> staging{};
+        {
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width            = desc.Width;
+            d.Height           = desc.Height;
+            d.DepthOrArraySize = 1;
+            d.MipLevels        = 1;
+            d.Format           = format;
+            d.SampleDesc.Count = 1;
+            d.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            d.Flags            = D3D12_RESOURCE_FLAG_NONE;
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&staging)))) {
+                note("skipped (its copy could not be made)");
+                continue;
+            }
+            staging->SetName(L"Diagnostics: a picture for the log");
+        }
+        k.commands.wait(0);
+        // (Every source is in the present state (the same as common) between frames: the eye images, the game's picture as presented, the
+        // interface layer's copy.)
+        const UINT64 before = k.commands.fence_value;
+        k.commands.copy(s.res, staging.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COMMON);
+        k.commands.execute();
+        ComPtr<ID3D12Fence> fence = k.commands.fence;
+        const UINT64        value = k.commands.fence_value;
+        if (fence == nullptr || value <= before) {
+            // (Its commands not given to the graphics card: nothing uses the picture; let go with it.)
+            note("skipped (not given to the graphics card)");
+            continue;
+        }
+        k.busy->store(true);
+        const auto path = Framework::get_persistent_dir(std::format("diag_{}_{}.jpg", n, s.what));
+        try {
+            std::thread([fence, value, staging, keep = s.keep, queue = ComPtr<ID3D12CommandQueue>{queue}, path, busy = k.busy,
+                            width = (uint64_t)desc.Width, height = desc.Height, since, load]() mutable {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                bool done = fence->GetCompletedValue() >= value;
+                if (!done) {
+                    if (HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); event != nullptr) {
+                        if (SUCCEEDED(fence->SetEventOnCompletion(value, event))) {
+                            WaitForSingleObject(event, 10000);
+                        }
+                        done = fence->GetCompletedValue() >= value;
+                        if (done) {
+                            CloseHandle(event); // (not closed if not: the fence may still signal it)
+                        }
+                    }
+                }
+                if (!done) {
+                    // (The copy may still write the picture and read its source: both kept for good (a deliberate small leak rather than
+                    // memory freed under the graphics card), and this kind never saved again this session.)
+                    staging.Detach();
+                    keep.Detach();
+                    spdlog::warn("[Diag] (fix201) {} not saved: the graphics card had not made its copy 10 s on", path.string());
+                    return;
+                }
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED); // (left as it is: the thread ends here)
+                const HRESULT hr = DirectX::SaveWICTextureToFile(queue.Get(), staging.Get(), GUID_ContainerFormatJpeg, path.wstring().c_str(),
+                    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON);
+                spdlog::info("[Diag] (fix201) saved {} ({}x{}; the picture of {:.1f} s after loading screen {} ended; hr {:x})", path.string(), width,
+                    height, since / 1000.0, load, (uint32_t)hr);
+                busy->store(false);
+            }).detach();
+        } catch (...) {
+            // (No thread: the picture kept until the graphics card is past its copy, then freed as the other pictures let go are.)
+            RetiredGpu retired{.what = "a diagnostics picture (no thread to save it)"};
+            retired.objects.emplace_back(staging);
+            if (s.keep != nullptr) {
+                retired.objects.emplace_back(s.keep);
+            }
+            retired.fences.emplace_back(fence, value);
+            retire(std::move(retired));
+            k.busy->store(false);
+            note("skipped (no thread)");
+            continue;
+        }
+        note(std::format("being saved ({}x{})", (uint64_t)desc.Width, desc.Height));
+    }
+    spdlog::info("[Diag] (fix201) pictures at {:.1f} s after loading screen {} ended (diag_{}_*.jpg; the eyes {}): {}", since / 1000.0, load, n, eyes,
+        notes);
 }
 
 bool D3D12Component::present_native_previous_left(VR* vr, uint32_t frame) {

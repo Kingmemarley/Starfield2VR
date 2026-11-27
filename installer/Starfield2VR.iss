@@ -25,7 +25,7 @@
 ; (/TYPE is Inno Setup's own parameter for setup types, so the install type is /INSTALLTYPE.)
 
 #ifndef AppVersion
-  #define AppVersion "1.1.0"
+  #define AppVersion "1.1.1"
 #endif
 #define AppName "Starfield2VR"
 #define AppPublisher "Kingmemarley"

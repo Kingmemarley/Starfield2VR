@@ -280,7 +280,16 @@ namespace MenuLayer
             // (Each different arrangement of its textures logged, the first few.)
             const uint64_t signature = (static_cast<uint64_t>(io.count) << 56) ^ (static_cast<uint64_t>(target + 1) << 48) ^ (static_cast<uint64_t>(layer + 1) << 40) ^
                                        (static_cast<uint64_t>(candidates) << 32) ^ (target >= 0 ? (descs[target].Width << 16) ^ descs[target].Height : 0);
-            if (g_last_signature.exchange(signature) != signature && g_signatures_logged.fetch_add(1) < 8) {
+            // (fix201) And every change in the 90 s after a loading screen ends (at most 200 more a session): which texture the left eye's and
+            // the panel's interface comes from then.
+            static std::atomic<int> s_diag_logged{ 0 };
+            const int64_t           diag_since = VR::get()->diag_ms_since_load();
+            if (g_last_signature.exchange(signature) != signature &&
+                (g_signatures_logged.fetch_add(1) < 8 || (diag_since >= 0 && s_diag_logged.fetch_add(1) < 200))) {
+                if (diag_since >= 0) {
+                    spdlog::info("[MenuLayer] (fix201) {:.1f} s after loading screen {} ended (for {}):", diag_since / 1000.0, VR::get()->m_diag_loads.load(),
+                        menu_wanted ? "a see-through menu" : "full stereo's left eye");
+                }
                 std::string list;
                 for (uint32_t i = 0; i < io.count; ++i) {
                     list += fmt::format("; [{}] key {:x} index {} flags {:#x} (state {:#x}): {}", i, io.items[i].key, io.items[i].graph_index, io.items[i].flags,

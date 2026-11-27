@@ -109,19 +109,23 @@ namespace SeatView
         // Sitting (the sit state, bits 11-12 of the player's +0xFC: 2, sitting or lying) with the game's own body shown in first person
         // ([player+0x112A] bit 3, the game's seat view), the camera in first person, no ladder, the mod's own body off, no loading screen,
         // the setting on. (The flight HUD is checked by the caller.)
+        // (fix202) And the game's own seat-view flag ([player+0x112F] bit 3, set by its body-in-a-seat view): the third-person mark alone
+        // is also set by a seat the game turns the player to third person for (the character-creation bench), which is not this view.
         bool Seated()
         {
             if (!GameFlow::gStore.internalSettings.seatViewAtEyes) {
                 return false;
             }
-            const auto player = reinterpret_cast<uintptr_t>(CreationEngineSingletonManager::GetPlayerRef());
-            uint32_t   state2 = 0;
-            uint8_t    mark   = 0;
-            if (player == 0 || !ReadBytes(player + 0xFC, &state2, sizeof(state2)) || !ReadBytes(player + 0x112A, &mark, sizeof(mark))) {
+            const auto player   = reinterpret_cast<uintptr_t>(CreationEngineSingletonManager::GetPlayerRef());
+            uint32_t   state2   = 0;
+            uint8_t    mark     = 0;
+            uint8_t    seat_rig = 0;
+            if (player == 0 || !ReadBytes(player + 0xFC, &state2, sizeof(state2)) || !ReadBytes(player + 0x112A, &mark, sizeof(mark)) ||
+                !ReadBytes(player + 0x112F, &seat_rig, sizeof(seat_rig))) {
                 return false;
             }
-            return ((state2 >> 11) & 3u) == 2 && (mark & 8) != 0 && GameFlow::isInFirstPerson() && !GameFlow::isOnLadder() &&
-                   !GameFlow::isLoadingScreenShown() && !body::IsActive();
+            return ((state2 >> 11) & 3u) == 2 && (mark & 8) != 0 && (seat_rig & 8) != 0 && GameFlow::isInFirstPerson() &&
+                   !GameFlow::isOnLadder() && !GameFlow::isLoadingScreenShown() && !body::IsActive();
         }
 
         bool Finite(const glm::vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }

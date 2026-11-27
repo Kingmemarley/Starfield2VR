@@ -101,6 +101,9 @@ namespace GameFlow {
     // once (used to put the view back at the player's head after every load).
     void noteLoadingScreen();
     bool takeRecenterAfterLoading();
+    // (fix201) Diagnostics, called once a game frame: notes each loading screen's end (for the 90 s of diagnostics after it, VR's
+    // m_diag_load_end_ms) and logs the movies the game drew in each second (always in those 90 s, else when the set changes).
+    void diagnosticsTick();
     // When a loading screen was last drawn (an opaque time; changes with every loading screen).
     int64_t lastLoadingScreen();
     // (fix164) A loading screen (Interface/LoadingMenu.swf) was drawn within the last 0.3 s.

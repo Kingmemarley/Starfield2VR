@@ -718,6 +718,23 @@ private:
         uint64_t two_pictures{0}, one_picture{0};
         std::chrono::steady_clock::time_point stats_at{};
     } m_aer{};
+    // (fix201) Diagnostics: for 90 s after a loading screen ends, every 10 s (at 1, 11 ... 81 s), the left eye's picture (full stereo), the
+    // game's picture (the right eye in full stereo, both eyes otherwise) and the interface layer's copy saved to sfvr\diag_<n>_left.jpg,
+    // _game.jpg and _ui.jpg (n a ring of 10: at most 30 files). Each is copied on the graphics card into a picture of the mod's own, made
+    // for that save alone, and a thread of its own saves that once the card has made the copy (the picture then freed): the present thread
+    // waits neither for the card nor for the file, and no video memory is held between saves.
+    struct DiagPictures {
+        struct Kind {
+            d3d12::CommandContext              commands{};
+            bool                               commands_ready{false};
+            std::shared_ptr<std::atomic<bool>> busy{std::make_shared<std::atomic<bool>>(false)}; // (a save running for it)
+        };
+        std::array<Kind, 3> kinds{};
+        uint32_t load{0};
+        int last_tick{-1};
+        uint32_t ring{0};
+    } m_diag{};
+    void diag_pictures(VR* vr, ID3D12Resource* game_picture, bool native, const char* eyes, ID3D12CommandQueue* queue);
     // The left eye of a full stereo frame into its eye image (true), or nothing when that frame's world picture is not there.
     bool present_native_left(uint32_t frame);
     // (fix147) A full stereo frame whose own left picture is not there: the left eye's last picture into its eye image again, submitted

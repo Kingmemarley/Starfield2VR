@@ -29,7 +29,8 @@ namespace body
     // move the view then); false when the head bone or the camera is not known.
     bool SeatCameraUnderHead(bool& under);
     // (fix146) Hooks the game's switch between first and third person: the bodies put as in first person before a turn to third person
-    // (the shown body made the game take it for third person already and skip its animations: no ladder climbs).
+    // (the shown body made the game take it for third person already and skip its animations: no ladder climbs). (fix202) Every turn to
+    // third person, not only a ladder's (seats the game plays in third person, such as the character-creation bench).
     void InstallSwitchHook();
     // How far to lower the view below the game's camera while crouching (metres, world up, <= 0).
     float ViewHeightOffset();

@@ -153,6 +153,7 @@ std::optional<std::string> CreationEngineEntry::on_initialize()
 void CreationEngineEntry::on_frame()
 {
     MenuPointer::Watchdog();
+    GameFlow::diagnosticsTick(); // (fix201)
     // (fix198, the review) This thread kept (the VR tab's changes are applied on it), and what that tab's handlers left for it run, in order.
     m_frame_thread = GetCurrentThreadId();
     {

@@ -3654,6 +3654,98 @@ XrResult OpenXR::end_frame() {
         }
     }
 
+    // (fix201) Diagnostics: the layers handed over, one line whenever they change (each layer's kind, picture, size, space and flags).
+    // Always in the 90 s after a loading screen ends (at most 150 lines in them), else at most 200 lines a session; at most a line every
+    // quarter second (the changes between counted on the next line; the state after a burst logged once it has held a quarter second).
+    {
+        const auto swapchain_name = [&](XrSwapchain s) -> std::string {
+            for (size_t i = 0; i < this->swapchains.size(); ++i) {
+                if (this->swapchains[i].handle == s) {
+                    return i == 0 ? "left eye" : (i == 1 ? "right eye" : fmt::format("eye {}", i));
+                }
+            }
+            return s == this->panel_swapchain     ? "menu panel"
+                 : s == this->reticle_swapchain   ? "strip"
+                 : s == this->ambient_swapchain   ? "soft light"
+                 : s == this->conv_swapchain      ? "conversation"
+                 : s == this->wheel_swapchain     ? "favorites wheel"
+                 : s == this->console_swapchain   ? "build console"
+                 : s == this->fw_menu_swapchain   ? "mod menu"
+                 : s == XR_NULL_HANDLE            ? "none"
+                                                  : fmt::format("swapchain {:x}", (uint64_t)s);
+        };
+        const auto space_name = [&](XrSpace s) -> const char* {
+            return s == this->stage_space ? "room" : s == this->view_space ? "head" : "other space";
+        };
+        uint64_t sig = 1469598103934665603ull;
+        const auto mix = [&sig](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+        for (const auto* l : layers) {
+            mix((uint64_t)l->type);
+            mix((uint64_t)l->space);
+            mix((uint64_t)l->layerFlags);
+            if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                const auto* p = reinterpret_cast<const XrCompositionLayerProjection*>(l);
+                mix(p->viewCount);
+                if (p->viewCount > 0 && p->views != nullptr) {
+                    mix((uint64_t)p->views[0].subImage.swapchain);
+                    mix(((uint64_t)p->views[0].subImage.imageRect.extent.width << 32) | (uint32_t)p->views[0].subImage.imageRect.extent.height);
+                }
+            } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                const auto* q = reinterpret_cast<const XrCompositionLayerQuad*>(l);
+                mix((uint64_t)q->subImage.swapchain);
+                mix(((uint64_t)q->subImage.imageRect.extent.width << 32) | (uint32_t)q->subImage.imageRect.extent.height);
+            } else if (l->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
+                const auto* c = reinterpret_cast<const XrCompositionLayerCylinderKHR*>(l);
+                mix((uint64_t)c->subImage.swapchain);
+                mix(((uint64_t)c->subImage.imageRect.extent.width << 32) | (uint32_t)c->subImage.imageRect.extent.height);
+            }
+        }
+        if (sig != this->diag_layers_sig) {
+            this->diag_layers_sig = sig;
+            ++this->diag_layers_changes;
+        }
+        const bool in_window = this->diag_since_load_ms >= 0;
+        if (in_window && this->diag_layers_load != this->diag_load) {
+            this->diag_layers_load       = this->diag_load;
+            this->diag_layers_lines_load = 0;
+        }
+        const auto now      = std::chrono::steady_clock::now();
+        const bool room     = in_window ? this->diag_layers_lines_load < 150 : this->diag_layers_lines_other < 200;
+        if (sig != this->diag_layers_logged_sig && room && now - this->diag_layers_logged_at >= std::chrono::milliseconds(250)) {
+            ++(in_window ? this->diag_layers_lines_load : this->diag_layers_lines_other);
+            std::string list{};
+            for (size_t i = 0; i < layers.size(); ++i) {
+                const auto* l = layers[i];
+                std::string what{};
+                if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                    const auto* p = reinterpret_cast<const XrCompositionLayerProjection*>(l);
+                    const bool  has = p->viewCount > 0 && p->views != nullptr;
+                    what = fmt::format("projection of {} views, {} {}x{}{}", p->viewCount, has ? swapchain_name(p->views[0].subImage.swapchain) : "none",
+                        has ? p->views[0].subImage.imageRect.extent.width : 0, has ? p->views[0].subImage.imageRect.extent.height : 0,
+                        p->viewCount > 1 && p->views != nullptr ? fmt::format(" / {}", swapchain_name(p->views[1].subImage.swapchain)) : std::string{});
+                } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    const auto* q = reinterpret_cast<const XrCompositionLayerQuad*>(l);
+                    what = fmt::format("quad, {} {}x{} at {},{}, {:.2f} x {:.2f} m", swapchain_name(q->subImage.swapchain), q->subImage.imageRect.extent.width,
+                        q->subImage.imageRect.extent.height, q->subImage.imageRect.offset.x, q->subImage.imageRect.offset.y, q->size.width, q->size.height);
+                } else if (l->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
+                    const auto* c = reinterpret_cast<const XrCompositionLayerCylinderKHR*>(l);
+                    what = fmt::format("cylinder, {} {}x{} at {},{}, radius {:.2f} m, {:.0f} deg", swapchain_name(c->subImage.swapchain),
+                        c->subImage.imageRect.extent.width, c->subImage.imageRect.extent.height, c->subImage.imageRect.offset.x, c->subImage.imageRect.offset.y,
+                        c->radius, c->centralAngle * 57.2957795f);
+                } else {
+                    what = fmt::format("type {}", (int)l->type);
+                }
+                list += fmt::format("{}[{}] {} ({}, flags {:#x})", i == 0 ? "" : "; ", i, what, space_name(l->space), (uint64_t)l->layerFlags);
+            }
+            spdlog::info("[Layers] (fix201) the headset's layers now{} ({} change(s) since the last line): {}",
+                in_window ? fmt::format(", {:.1f} s after loading screen {} ended", this->diag_since_load_ms / 1000.0, this->diag_load) : std::string{},
+                this->diag_layers_changes, list.empty() ? std::string{"none"} : list);
+            this->diag_layers_logged_sig = sig;
+            this->diag_layers_logged_at  = now;
+            this->diag_layers_changes    = 0;
+        }
+    }
+
     XrFrameEndInfo frame_end_info{XR_TYPE_FRAME_END_INFO};
     frame_end_info.displayTime = this->frame_state.predictedDisplayTime;
     frame_end_info.environmentBlendMode = this->blend_mode;

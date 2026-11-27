@@ -401,6 +401,21 @@ public:
     // (The same, for any thread: a copy the game's frames used is let go only some presents after its last use, as the GPU is then
     // surely done with it: the CPU cannot get more than a few frames ahead of the GPU.)
     std::atomic<uint32_t> m_presents_done{0};
+    // (fix201) Diagnostics after a loading screen: when the last one ended (steady clock, milliseconds; 0 none yet) and how many have
+    // ended, set by the game side (GameFlow::diagnosticsTick). For 90 s after each, the headset's layers and pictures are logged.
+    std::atomic<int64_t>  m_diag_load_end_ms{0};
+    std::atomic<uint32_t> m_diag_loads{0};
+    static constexpr int64_t kDiagWindowMs = 90000;
+    // (fix201) Milliseconds since the last loading screen ended, while that is under 90 s; else -1.
+    int64_t diag_ms_since_load() const {
+        const int64_t end = m_diag_load_end_ms.load(std::memory_order_relaxed);
+        if (end == 0) {
+            return -1;
+        }
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t since = now - end;
+        return since >= 0 && since < kDiagWindowMs ? since : -1;
+    }
     // (fix179) When the game thread began its last frames (steady clock, microseconds; on_wait_rendering, once a game frame), and how many
     // it began: a menu's slow frames are told how long the game thread's frames around them took (D3D12Component::note_menu_frame).
     std::array<std::atomic<int64_t>, 32> m_game_frame_us{};

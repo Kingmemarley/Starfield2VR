@@ -172,6 +172,19 @@ public:
     std::vector<XrView> views{};
     std::vector<XrView> stage_views{};
 
+    // (fix201) Diagnostics: milliseconds since the last loading screen ended while under 90 s (else -1) and its number, set by the present
+    // thread each present (D3D12Component::on_frame from VR::diag_ms_since_load); and end_frame's record of the layers it handed over, one
+    // line each time they change (the present thread only).
+    int64_t diag_since_load_ms{-1};
+    uint32_t diag_load{0};
+    uint64_t diag_layers_sig{0};        // this frame's layers
+    uint64_t diag_layers_logged_sig{0}; // the ones last logged
+    std::chrono::steady_clock::time_point diag_layers_logged_at{};
+    uint32_t diag_layers_changes{0};    // changes since the last line
+    uint32_t diag_layers_load{0};       // the load the lines below are counted for
+    int diag_layers_lines_load{0};      // lines in this load's 90 s
+    int diag_layers_lines_other{0};     // lines outside them, this session
+
     float resolution_scale{1.0f};
     float clamped_scale() const; // resolution_scale, no bigger than the runtime's largest eye image allows (view_configs not empty)
     // Mono (VR::is_mono): the frame being ended was drawn once from the middle of the head; both views are submitted from there.

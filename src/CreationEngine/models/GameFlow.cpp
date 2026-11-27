@@ -64,6 +64,7 @@ namespace GameFlow
 
     namespace {
         std::atomic<bool>    g_recenter_pending{false};
+        std::atomic<bool>    g_diag_pending{false}; // (fix201) a loading screen drawn, its end not yet noted for the diagnostics
         std::atomic<int64_t> g_last_loading_ms{0};
         std::atomic<int64_t> g_last_main_menu_ms{-100000};
         std::atomic<int64_t> g_last_ship_hud_ms{-100000};
@@ -83,6 +84,7 @@ namespace GameFlow
     void noteLoadingScreen() {
         g_last_loading_ms = now_ms();
         g_recenter_pending = true;
+        g_diag_pending = true; // (fix201)
     }
 
     int64_t lastLoadingScreen() {
@@ -619,8 +621,28 @@ namespace GameFlow
         return false;
     }
 
+    namespace {
+        // (fix201) Diagnostics: each movie the game sets up for drawing (renderMenu, on the game's interface threads), counted for a second
+        // at a time and logged once a second by diagnosticsTick (always for 90 s after a loading screen ends, else when the set changes).
+        struct CensusEntry {
+            std::string name;
+            uint32_t    calls{ 0 };
+        };
+        std::mutex                                  g_census_mtx{};
+        std::unordered_map<uint32_t, CensusEntry> g_census{};
+
+        void noteCensus(uint32_t hash, std::string_view name) {
+            std::scoped_lock _{ g_census_mtx };
+            auto& e = g_census[hash];
+            if (e.calls++ == 0) {
+                e.name.assign(name.data(), name.size()); // (a copy: the game frees a movie's name when its menu closes)
+            }
+        }
+    }
+
     void renderMenu(std::string_view menuNameHash) {
         const auto hash = djb2Hash(menuNameHash.data());
+        noteCensus(hash, menuNameHash); // (fix201)
         if (hash == "Interface/LoadingMenu.swf"_DJB || hash == "Interface/LoadingMenu_LRG.swf"_DJB) {
             noteLoadingScreen();
         }
@@ -970,5 +992,73 @@ namespace GameFlow {
         w.rt += rt && !w.rt_was;
         w.lt_was = lt;
         w.rt_was = rt;
+    }
+}
+
+namespace GameFlow {
+    // (fix201) Diagnostics, once a game frame (CreationEngineEntry::on_frame, the game's frame thread).
+    void diagnosticsTick() {
+        const int64_t now = now_ms();
+        static int64_t load_end = 0;
+        static uint32_t loads = 0;
+        // A loading screen's end, as the recentre after loading takes it: gone 1.5 s, the player there, no menu shown.
+        if (g_diag_pending.load() && now - g_last_loading_ms.load() >= 1500 && CreationEngineSingletonManager::GetPlayerRef() != nullptr &&
+            !isShowingMenu()) {
+            g_diag_pending = false;
+            load_end = now;
+            ++loads;
+            if (auto& v = VR::get(); v != nullptr) {
+                v->m_diag_load_end_ms = now;
+                v->m_diag_loads = loads;
+            }
+            spdlog::info("[Diag] (fix201) loading screen {} ended (gone 1.5 s, the player there, no menu shown): diagnostics running for 90 s: the "
+                         "movies the game draws each second, each change of the headset's layers, the interface pass's textures, and pictures every "
+                         "10 s (sfvr/diag_<n>_left.jpg, _game.jpg, _ui.jpg)",
+                loads);
+        }
+        // Once a second: the movies set up for drawing in it (each with its count of calls).
+        static int64_t               last_ms = 0;
+        static std::vector<uint32_t> last_set{};
+        static int                   change_lines = 0;
+        if (now - last_ms < 1000) {
+            return;
+        }
+        last_ms = now;
+        std::vector<std::pair<std::string, uint32_t>> drawn{};
+        std::vector<uint32_t>                         set{};
+        {
+            std::scoped_lock _{ g_census_mtx };
+            drawn.reserve(g_census.size());
+            set.reserve(g_census.size());
+            for (const auto& [hash, e] : g_census) {
+                drawn.emplace_back(e.name, e.calls);
+                set.push_back(hash);
+            }
+            g_census.clear();
+        }
+        std::sort(set.begin(), set.end());
+        std::sort(drawn.begin(), drawn.end());
+        const bool    changed = set != last_set;
+        last_set              = std::move(set);
+        const int64_t since   = load_end != 0 ? now - load_end : -1;
+        const bool    window  = since >= 0 && since < 90000;
+        if (!window && (!changed || change_lines >= 300)) {
+            return;
+        }
+        if (!window) {
+            ++change_lines;
+        }
+        std::string list{};
+        for (const auto& [name, calls] : drawn) {
+            std::string_view n{ name };
+            if (const auto slash = n.find_last_of("/\\"); slash != std::string_view::npos) {
+                n = n.substr(slash + 1);
+            }
+            list += fmt::format("{}{} x{}", list.empty() ? "" : ", ", n, calls);
+        }
+        spdlog::info("[Diag] (fix201) the movies the game drew in the last second{}: {}; the mod's view: a menu shown {}, a loading screen {}, "
+                     "menus counted {}, menus set up now: {}",
+            window ? fmt::format(" ({:.0f} s after loading screen {} ended)", since / 1000.0, loads) : std::string{ " (the set changed)" },
+            list.empty() ? std::string{ "none" } : list, isShowingMenu(), isLoadingScreenShown(), lastMenuCount(), shownMenus());
     }
 }
