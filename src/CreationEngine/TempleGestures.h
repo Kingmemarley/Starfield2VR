@@ -20,6 +20,13 @@ namespace TempleGestures
     // (The game's input.) LB pressed now for a gesture; a trigger held back (left: the left controller's).
     bool PressLeftShoulder();
     bool HoldsTrigger(bool left);
+
+    // (fix205) For the Data menu at the right temple (ModConfig: the right controller in your hands held beside the right side of your head,
+    // the same box as the scanner's gesture, and its thumbstick clicked: a tap of Start for the game instead of the click). (Any thread) That
+    // controller in your hands (not the game's hand: Swap Controller Inputs does not move it, as it does not move the temples) is beside its
+    // own side's temple now, with the headset on and the controllers in use; where it is in the box's axes (metres from the eyes: out to its
+    // side, up, ahead), for the log.
+    bool AtOwnTemple(bool physical_left, float* side = nullptr, float* up = nullptr, float* ahead = nullptr);
     std::string Status();
     // (fix174) The game's scene update of a node, before its own (CreationEngineCameraManager::onNiAVObjectUpdateWorld, the game's update
     // threads): the flashlight's light, while the body is shown, un-hidden and put at your head shining where you look.

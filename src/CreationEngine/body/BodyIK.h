@@ -50,6 +50,9 @@ namespace body
     bool BarrelKnown();
     // The player fired: the weapon's pose in the first-person rig is sampled as its firing grip.
     void NotifyPlayerFired();
+    // (fix206) A continuous beam (the cutter) fired from the gun in your hand this frame: a multi-beam weapon's firing hold is learned
+    // only on these frames.
+    void NotifyBeamFrame();
     // The left hand holds the weapon's support grip (two-handed) this frame. (fix198: drawn on it, whether or not it steers the gun.)
     bool IsSupportHandOnGun();
     // (fix198) The gun is held in both hands this frame (the left grip squeezed at its support grip, steering it): the left grip is the

@@ -18,12 +18,14 @@ licensed.
 
 - [Features](#features)
 - [Requirements](#requirements)
+- [Headsets and controllers](#headsets-and-controllers)
 - [Installation](#installation)
 - [First start](#first-start)
 - [Controls](#controls)
 - [Settings](#settings)
 - [Compatibility](#compatibility)
 - [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
 - [Reporting bugs](#reporting-bugs)
 - [Building from source](#building-from-source)
@@ -87,13 +89,40 @@ licensed.
 | - | - |
 | **Starfield 1.16.244, Steam** | Check it: right-click `Starfield.exe` > Properties > Details. It should say `1.16.244.0`. On any other version the mod's own features switch themselves off, and the log and the F11 window say so. The Game Pass / Microsoft Store version is not supported by this release. |
 | **A PC VR headset with an OpenXR runtime** | Developed and tested with a Meta Quest 3 over Virtual Desktop (VDXR). Other OpenXR runtimes (Meta Quest Link, SteamVR's OpenXR runtime, Windows Mixed Reality) should work, but have not been tested yet. Your runtime must be set as the active OpenXR runtime. |
-| **Motion controllers** | Made for Meta Touch controllers (A/B/X/Y, grips, triggers, thumbsticks, **thumbrests**). The code also has bindings for Valve Index, HTC Vive and Windows Mixed Reality controllers. Those have not been tested yet. They have no thumbrest sensor, so you need the Alternative Joy Layout (see [CONTROLS.md](CONTROLS.md)). |
+| **Motion controllers** | Made for Meta Touch controllers (A/B/X/Y, grips, triggers, thumbsticks). The code also has bindings for Valve Index, HTC Vive, Windows Mixed Reality and Steam Frame controllers. Those have not been tested yet. The thumbrests are not needed (off by default; see [CONTROLS.md](CONTROLS.md)). On Index controllers the trackpad presses are LB and RB, and the system button opens the Data menu (not on SteamVR). |
 | **Microsoft Visual C++ runtime (x64), 14.51 or newer** | The installer checks it and offers Microsoft's download. Installing by hand: get the [latest x64 runtime](https://aka.ms/vc14/vc_redist.x64.exe) from Microsoft. |
 | **No ViGEmBus driver needed** | The mod gives the game its own virtual Xbox controller through Windows' gamepad list. If that ever fails, it falls back to the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0) driver when it is installed (the log says which way it used). |
 | **Windows 10 or 11, 64-bit, a CPU with AVX2** | The release is built with AVX2. A CPU that runs Starfield should have it. |
 | **A strong graphics card** | The code has no minimum, but VR is heavy. An NVIDIA RTX card is recommended: each eye keeps its own DLSS history, and the laser sight's dot lands on what you point at only with DLSS. Without DLSS (FSR, TAA) the game still runs, but the dot sits at a fixed distance. Foveated shading needs a card with variable rate shading tier 2. |
 
 SFSE and the Address Library are **not** needed.
+
+---
+
+## Headsets and controllers
+
+What has been run so far, and what each setup needs. "Reported" means a player has run it; "not tested" means the mod has
+bindings for it but nobody has confirmed them yet. Please report how your setup works (attach `sfvr_log.txt`).
+
+| Headset / controllers | Runtime | Status | What to set or know |
+| - | - | - | - |
+| **Meta Quest 3** (Touch controllers) | Virtual Desktop (VDXR) | Developed and tested | The reference setup. The left menu button opens the Data menu. |
+| **Meta Quest 2 / 3** (Touch) | Meta Quest Link (Meta's OpenXR runtime) | Should work, not tested | As with VDXR. |
+| **Meta Quest 2 / 3** (Touch) | SteamVR (Steam Link, or Virtual Desktop in SteamVR mode) | Reported | SteamVR keeps the left menu button for its dashboard: open the Data menu with the **right controller at your right temple + a right stick click**. If the controllers do nothing at all, **turn off Steam Input for Starfield** (Steam > Starfield > Properties > Controller > Disable Steam Input). Using VDXR or Quest Link instead avoids both. |
+| **PlayStation VR2** (Sense controllers) | SteamVR | Reported | The PS button is SteamVR's: open the Data menu with the right temple + right stick click, or bind Options to the mod's **SystemButton** in SteamVR's controller bindings ([how](CONTROLS.md#when-the-menu-button-does-nothing-steamvr-playstation-vr2)). |
+| **Pimax Dream Air** (Valve Index controllers) | Pimax Play's OpenXR runtime | Reported | **Turn passthrough off** in Pimax Play, or the headset shows a black screen. The Index's system button opens the Data menu; its **trackpad press** is LB/RB; the grip counts at a normal squeeze. |
+| **Valve Index** (Index controllers) | SteamVR | Not tested | SteamVR keeps the system button: use the right temple + right stick click for the Data menu. Trackpad press = LB/RB. |
+| **Steam Frame** (Steam Frame controllers) | SteamVR | Not tested | Its own bindings: A/B/X/Y on the right controller as printed, bumpers = LB/RB, the left D-pad, View = Back, Menu = Data menu. |
+| Vive wands, Windows Mixed Reality | SteamVR / WMR | Not tested | Bindings exist; their click grips count as a full squeeze. |
+
+**Settings every setup needs:**
+- Starfield **1.16.244 (Steam)**; your headset's software set as the active **OpenXR runtime**.
+- In the game: **Display Mode: Windowed** (required: full screen gives a black screen) and **Frame Generation off**. DLSS recommended.
+- **Pimax:** passthrough off.
+- **SteamVR:** the Data menu by the right temple + right stick click; Steam Input off for Starfield if the controllers do nothing.
+- **VectorXR:** keep its Frame Generation off for Starfield for now (it can hang the graphics card when it switches on).
+- Controllers without thumbrests (Index, Frame, Vive, WMR) get LB/RB from the trackpad press (Index) or the bumpers (Frame); on
+  any controller the gestures also work (grenade from your shoulder, palm push for powers, scanner at your right temple).
 
 ---
 
@@ -114,7 +143,9 @@ To install by hand instead, follow steps 2 to 4.
 Make your headset's software the active OpenXR runtime:
 - **Virtual Desktop**: in the streamer's settings, choose VDXR as the OpenXR runtime.
 - **Meta Quest Link**: Meta Quest Link app > Settings > General > OpenXR Runtime > set as active.
-- **SteamVR**: SteamVR Settings > OpenXR > set SteamVR as the OpenXR runtime.
+- **SteamVR**: SteamVR Settings > OpenXR > set SteamVR as the OpenXR runtime. SteamVR keeps Touch's left menu button (and Index's system
+  button) for its own dashboard: open the Data menu with the right controller at your right temple + right stick click (see
+  [CONTROLS.md](CONTROLS.md#when-the-menu-button-does-nothing-steamvr-playstation-vr2)).
 
 ### 3. Copy the two files
 
@@ -139,14 +170,17 @@ there, copy them into the game folder by hand.
 
 ### 4. Game settings
 
+- **Display mode: Windowed (required).** Settings > Display > Display Mode. Full screen results in a black screen in the
+  headset: the mod resizes the game's window to each eye's picture size, which is usually taller than your monitor, and
+  full screen can't take that size.
+- **Pimax headsets: passthrough off (required).** In Pimax Play, turn passthrough off before starting the game, or the
+  headset shows a black screen.
 - **Frame Generation: off.** It is not supported.
-- Set to windowed mode(Full Screen will result in Black Screen)
-- If using Pimax:Disable Passthrough(Passthrough will result in Black Screen)
 - DLSS is recommended (see Requirements).
 - Using the gun sight? Turn the game's own crosshair off (Settings > Interface).
 - Keep the game's controller vibration on if you want to feel hits and explosions.
-- The original starfield2vr also suggests: display mode windowed, V-Sync off, motion blur off, depth of field off, and
-  dynamic resolution off. These have not been re-tested with this mod.
+- The original starfield2vr also suggests: V-Sync off, motion blur off, depth of field off, and dynamic resolution off.
+  These have not been re-tested with this mod.
 
 ---
 
@@ -171,7 +205,7 @@ there, copy them into the game folder by hand.
      ship, your view starts at your seated body's eyes; leaning more than 15 cm from where you sat is held back softly, never
      past 30 cm).
    - **Turning**: Turn mode, Snap angle, Smooth turn speed.
-   - **Controllers**: Left-handed, Face buttons as printed, Controller vibration, Vibration strength.
+   - **Controllers**: Left-handed, Face buttons as printed, Thumbrests as LB/RB (off by default), Controller vibration, Vibration strength.
    - **HUD**: HUD size. **Climbing**: Climb with your hands, Climbing pull.
 
    The game's Defaults button resets every row of that tab to the mod's defaults, the eye mode (Full stereo) and the
@@ -233,9 +267,10 @@ The full guide is in **[CONTROLS.md](CONTROLS.md)**. The basics (default layout)
 | Right **B** | Sneak. In menus: back |
 | Left **X** | Reload. Hold: put weapons away or draw them. In menus: drop, transfer |
 | Left **Y** | Jump. In the air: boost pack. In menus: favorite |
-| Left thumbrest (touch) | Hand scanner on or off |
-| Right thumbrest (rest your thumb) | Grenade button. Lift your thumb to throw |
+| Left thumbrest (touch) | Hand scanner on or off. Only with Settings > VR > "Thumbrests as LB/RB" on (off by default) |
+| Right thumbrest (rest your thumb) | Grenade button. Lift your thumb to throw. Only with "Thumbrests as LB/RB" on |
 | Left menu button | Data menu. With the left grip held: switch first / third person |
+| Right controller at your right temple + right stick click | Data menu (in the Data menu: the pause menu). Works on every headset, also where the menu button doesn't reach the game (for example SteamVR) |
 | Palm pushed out, grip held | Your power |
 | Right grip behind right shoulder | Take a grenade, throw it with your arm |
 | Trigger at left / right temple | Flashlight / hand scanner |
@@ -359,6 +394,20 @@ extra headset frames from the game's. It has had a first test with this mod (Que
   Otherwise (OpenVR, or HDR on) it is drawn into the game's picture and needs the mouse.
 - In busy cities the "people near your hands" checks cost a little frame time.
 - The laser sight's dot lands on surfaces only with DLSS.
+
+---
+
+## Troubleshooting
+
+- **The headset shows a black screen, or the picture is the wrong shape.** Set the game's display mode to Windowed (Settings >
+  Display). With a Pimax headset, also turn passthrough off (below).
+- **Pimax: the headset shows a black screen.** Turn off passthrough in Pimax Play, then restart the game. (With a Pimax
+  headset the mod says so at the top of the game window for the first 30 seconds, and in F11.)
+- **The controllers do nothing in the game (SteamVR).** Turn off Steam Input for Starfield (Steam > Starfield > Properties >
+  Controller > Disable Steam Input), then restart the game.
+- **The Data menu does not open with the menu button** (SteamVR, PlayStation VR2): hold the right controller beside your
+  right temple and click the right thumbstick. See
+  [CONTROLS.md](CONTROLS.md#when-the-menu-button-does-nothing-steamvr-playstation-vr2).
 
 ---
 

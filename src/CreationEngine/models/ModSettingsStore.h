@@ -29,6 +29,10 @@ namespace GameFlow
             // (fix194) The face buttons send the game the button printed on them (Touch A, B, X, Y: the game's A, B, X, Y), so its
             // prompts name the button to press. Off: the old layout (right A = A, left X = B, right B = Y, left Y = X).
             bool faceButtonsAsPrinted{true};
+            // (fix205) The thumbrests send LB and RB (the left one's touch a tap of LB: the scanner; the right one's rest RB held: the grenade;
+            // in menus their tabs; never both at once). Off (the default): they send nothing; each of those has its own way (the right temple's
+            // trigger, the grenade from behind the shoulder, the palm push, pointing or the grips).
+            bool thumbrestsAsShoulders{false};
             bool decoupledPitch{false};
             bool pawnControl{true};
             // Shown body (ported from SFVR): the third-person body is drawn in first person, its arms

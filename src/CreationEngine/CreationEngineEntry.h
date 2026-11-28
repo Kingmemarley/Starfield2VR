@@ -75,6 +75,8 @@ private:
     const ModToggle::Ptr m_alternative_joy_layout{ ModToggle::create(generate_name("JoyAlternativeLayout"), false) };
     // (fix194) The face buttons as printed (GameFlow::gStore.internalSettings.faceButtonsAsPrinted); off: the old layout.
     const ModToggle::Ptr m_face_buttons_as_printed{ ModToggle::create(generate_name("FaceButtonsAsPrinted"), true) };
+    // (fix205) The thumbrests as LB and RB (GameFlow::gStore.internalSettings.thumbrestsAsShoulders); off by default.
+    const ModToggle::Ptr m_thumbrests_as_shoulders{ ModToggle::create(generate_name("ThumbrestsAsShoulders"), false) };
     // Shown body (ported from SFVR): third-person body in first person, arms on the controllers, gun in the hand.
     const ModToggle::Ptr m_show_body{ ModToggle::create(generate_name("ShowBody"), true) };
     const ModToggle::Ptr m_aim_with_gun_hand{ ModToggle::create(generate_name("AimWithGunHand"), true) };
@@ -215,6 +217,8 @@ private:
     void apply_body_settings();
     // Copies the turning, vibration, pointing and melee settings above into the game settings.
     void apply_comfort_settings();
+    // (fix205) The thumbrests as LB and RB, from its toggle, logged (`where`: the menu it was changed in).
+    void apply_thumbrests(const char* where);
     // (fix186) The rows of the VR tab in the game's Settings (VrSettingsTab.h), bound to the settings above.
     void set_vr_tab_rows();
     // (fix196) The settings' log lines after a change in the F11 menu; the interface parts list (Debug).
@@ -223,7 +227,7 @@ private:
     void draw_ui_parts_list();
 
 
-    ValueList m_options{*m_dominant_eye, *m_head_tracking_multiplier, *m_head_tracking_type, *m_taa_anf_nvidia_fix, *m_disable_zoom, *m_hud_scale, *m_hud_perspective, *m_alternative_joy_layout, *m_face_buttons_as_printed, *m_decoupled_pitch, *m_pawn_control_rotation, *m_sights_on_dominant_eye, *m_hud_on_optical_center, *m_weapon_stereo_depth, *m_gun_follows_controller, *m_gun_pitch_offset, *m_gun_yaw_offset, *m_gun_forward_offset, *m_gun_up_offset, *m_gun_head_reference, *m_recenter_after_loading, *m_detail_boost, *m_keep_gun_transform, *m_gun_reapply_before_animation, *m_force_full_detail, *m_first_person_eye_lens,
+    ValueList m_options{*m_dominant_eye, *m_head_tracking_multiplier, *m_head_tracking_type, *m_taa_anf_nvidia_fix, *m_disable_zoom, *m_hud_scale, *m_hud_perspective, *m_alternative_joy_layout, *m_face_buttons_as_printed, *m_thumbrests_as_shoulders, *m_decoupled_pitch, *m_pawn_control_rotation, *m_sights_on_dominant_eye, *m_hud_on_optical_center, *m_weapon_stereo_depth, *m_gun_follows_controller, *m_gun_pitch_offset, *m_gun_yaw_offset, *m_gun_forward_offset, *m_gun_up_offset, *m_gun_head_reference, *m_recenter_after_loading, *m_detail_boost, *m_keep_gun_transform, *m_gun_reapply_before_animation, *m_force_full_detail, *m_first_person_eye_lens,
         *m_show_body, *m_aim_with_gun_hand, *m_shoot_from_muzzle, *m_match_body_height, *m_body_lean, *m_body_facing, *m_support_hand, *m_finger_poses,
         *m_walking_legs, *m_body_tracking, *m_hand_tracking, *m_desktop_window_on_main_menu,
         *m_real_crouch, *m_crouch_view, *m_tie_view_to_body, *m_lock_gun_grip, *m_virtual_stock, *m_seat_view_at_eyes,

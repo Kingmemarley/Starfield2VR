@@ -453,6 +453,23 @@ namespace GameFlow
         return rows >= backbufferHeight - 2 ? 0 : rows;
     }
 
+    bool isOnlyDataMenuShown() {
+        const auto now = now_ms();
+        std::scoped_lock _{ g_menu_viewport_mtx };
+        bool data = false;
+        for (const auto& [hash, v] : g_menu_viewports) {
+            if (!viewportShown(v, now)) {
+                continue;
+            }
+            if (hash == "Interface/DataMenu.swf"_DJB || hash == "Interface/DataMenu_LRG.swf"_DJB) {
+                data = true;
+            } else {
+                return false; // (another menu shown with it)
+            }
+        }
+        return data;
+    }
+
     bool menuMovieFillsPicture(int backbufferWidth, int backbufferHeight) {
         const auto now = now_ms();
         std::scoped_lock _{ g_menu_viewport_mtx };

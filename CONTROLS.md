@@ -59,10 +59,11 @@ you changed the game's bindings, that column changes too.
 | Right thumbstick click | Right stick click | Melee |
 | Right trigger | RT | Fire |
 | Right grip | LT | Aim |
-| Left thumbrest, touched | LB, a short tap | Hand scanner on or off |
-| Right thumbrest, thumb resting | RB, held while your thumb rests there | Grenade (thrown as your thumb lifts) |
+| Left thumbrest, touched (only with "Thumbrests as LB/RB" on: off by default) | LB, a short tap | Hand scanner on or off |
+| Right thumbrest, thumb resting (only with "Thumbrests as LB/RB" on: off by default) | RB, held while your thumb rests there | Grenade (thrown as your thumb lifts) |
 | Left menu button | Start (Menu) | Data menu |
 | Left grip held + left menu button | Back (View) | Switch first / third person |
+| Right controller at your right temple + right thumbstick click | Start (Menu), a tap | Data menu. Works on every headset, also where the menu button doesn't reach the game (for example SteamVR). See [Menus](#menus) |
 | Palm push (see [Powers](#powers)) | LB + RB together | Your power |
 | D-pad | Only from combos (see [Favorites wheel](#favorites-wheel)) | Quick keys |
 
@@ -71,6 +72,10 @@ you changed the game's bindings, that column changes too.
   [Face buttons: the old layout](#face-buttons-the-old-layout).
 - The left trigger sends nothing to the game in play. It has its own jobs (the left-hand weapon, the favorites wheel, the
   flashlight).
+- **The thumbrests send nothing by default.** Settings > VR > "Thumbrests as LB/RB" turns them on. Without them: the hand
+  scanner is the right trigger at your right temple, a grenade comes from behind your right shoulder, your power is the
+  palm push, and a menu's tabs are clicked with the pointer (in character creation, the star map and build mode the grips
+  are LB and RB).
 - The thumbrests never send LB and RB at the same time, because together they are your power. If one is already down, the
   other waits until it is let go.
 - A stick click goes to the game at once, also both sticks together. The mod's menu opens only with F11 on the keyboard.
@@ -232,7 +237,7 @@ Equip a grenade first (it has its own slot).
 | Bring the hand forward | The game readies it (RB held) |
 | Let go of the grip as you throw | Thrown along your hand's throw. A throw slower than 1 m/s uses the game's own direction |
 | Let go before your hand leaves the shoulder | Put it back |
-| Rest your right thumb on the right thumbrest, then lift it | The game's own grenade throw (RB held while your thumb rests) |
+| Rest your right thumb on the right thumbrest, then lift it ("Thumbrests as LB/RB" on only) | The game's own grenade throw (RB held while your thumb rests) |
 
 A copy of the grenade shows in your hand while you hold it. It cannot be picked up.
 
@@ -242,7 +247,7 @@ A copy of the grenade shows in your hand while you hold it. It cannot be picked 
 
 | Input | What it does |
 | - | - |
-| Touch the left thumbrest | Hand scanner on or off (LB tap). It does nothing while the left grip is squeezed |
+| Touch the left thumbrest ("Thumbrests as LB/RB" on only) | Hand scanner on or off (LB tap). It does nothing while the left grip is squeezed |
 | Right hand beside your right temple, pull the right trigger | Hand scanner on or off |
 | Left hand beside your left temple, pull the left trigger | Flashlight on or off. No helmet needed |
 
@@ -299,14 +304,18 @@ Menus show on a panel that stays where it was put. Recenter (the mod's or your h
 | Right thumbstick up / down while pointing | Scroll |
 | Left thumbstick | Move through the menu as on a gamepad. The pointer steps aside until you move your hand or pull a trigger. A trigger then picks the highlighted item (as A) |
 | Left thumbstick left / right, in menus with side tabs (missions, crew, skills, research, almanac, ship; also trading and containers) | The menu's left / right step |
-| Left / right thumbrest (while not pointing) | LB / RB: the menu's previous / next tab |
+| Left / right thumbrest (while not pointing; "Thumbrests as LB/RB" on only) | LB / RB: the menu's previous / next tab. Without them: point at a tab and click it |
 | Right **A** | Select |
 | Right **B** | Back / close |
 | Left **X**, left **Y** | The menu's own X and Y actions, as the hints at the bottom show (in the inventory: X drops the item, Y makes it a favorite). In Settings, Y is Defaults |
 | Left menu button | Start: the Data menu. From the Data menu, the pause menu |
+| Right controller at your right temple + right thumbstick click | In play: the Data menu. In the Data menu: the pause menu (as the menu button). A short buzz when it works |
 | Left grip + left trigger + left thumbstick | D-pad |
 
 - The hints at the bottom name the buttons as printed on your controllers.
+- The right temple's stick click counts only when the click starts with the controller beside your head (where the
+  trigger opens the hand scanner), both grips let go and nothing in your right hand. Anywhere else the click is melee at once,
+  as before. With the left grip held it stays the eye-mode switch. It does nothing in other menus, conversations and build mode.
 - While you point, the sticks, triggers and thumbrests are kept from the game, so a resting thumb does not switch tabs.
 - A thumbrest touch that starts within half a second after a menu, a conversation, build mode or the hand scanner closes
   is not LB or RB. Lift the thumb and touch again. (Backing out with right **B** brings your right thumb back to its rest,
@@ -479,7 +488,7 @@ shoulder buttons on the triggers. Not tested yet.
 
 | Input | Default layout | Alternative layout |
 | - | - | - |
-| Thumbrests | LB tap (left), RB held (right) | Nothing |
+| Thumbrests | LB tap (left), RB held (right), with "Thumbrests as LB/RB" on | Nothing |
 | Left grip + right trigger | Fire | RB (no fire) |
 | Left grip + left trigger | Favorites wheel | LB |
 | Left grip + both triggers | Favorites wheel | LB + RB: your power |
@@ -512,15 +521,75 @@ What the code shows:
 
 ## Other controllers
 
-The mod has OpenXR bindings for Meta Touch, Valve Index, HTC Vive, Windows Mixed Reality and the basic OpenXR controller.
+The mod has OpenXR bindings for Meta Touch, Valve Index, HTC Vive, Windows Mixed Reality, the Steam Frame controllers and the
+basic OpenXR controller.
 Only Meta Touch has been tested.
 
-- **Index:** each hand's A and B work as on Touch (the left A as X, the left B as Y). There is no thumbrest, so use the
-  Alternative Joy Layout.
+- **Index:** see [Valve Index controllers](#valve-index-controllers) below.
 - **Vive wands and Windows Mixed Reality:** clicking the touchpad near an edge stands in for the face buttons:
   - left pad: bottom = X, right = Y, top = stick click;
   - right pad: bottom = A, left = B, top = stick click.
+  - Their grip is a click: a click counts as a full squeeze (grabbing and climbing work with it).
 - F11 > Debug > "Headset and runtime" > Bindings can change the OpenXR bindings.
+
+### Valve Index controllers
+
+Not tested yet.
+
+| Index input | What it does (the Touch button it stands for) |
+| - | - |
+| Left **A** / left **B** | As Touch X / Y (the lower and upper buttons), so in the old layout B and X |
+| Right **A** / right **B** | As Touch A / B |
+| **System** button (either hand) | Start: the Data menu; in the Data menu, the pause menu. With the left grip held: View (first / third person). Not on SteamVR, which keeps it for its dashboard: use the right controller at your right temple + right thumbstick click there |
+| Left **trackpad**, pressed | LB, a tap: the hand scanner; in menus (while not pointing) the previous tab |
+| Right **trackpad**, pressed | RB, held while pressed: a grenade (thrown as you let go); in menus (while not pointing) the next tab |
+| Sticks, triggers, grips | As on Touch |
+
+- The trackpads count as pressed past about half of their press sensor, and let go below about a third. They are always on,
+  whatever "Thumbrests as LB/RB" says, also on SteamVR, with the grip held and in the Alternative Joy Layout. They never send LB and RB at
+  the same time: your power is the palm push.
+- The grip button (aiming, the left grip's combos, the favorites wheel) counts from about three quarters of a squeeze and lets
+  go below about 40%, as grabbing does. On SteamVR, SteamVR's own controller bindings decide it instead.
+- The hand gestures work as on Touch: the hand scanner with the right trigger at your right temple, the flashlight at your left
+  temple, a grenade from behind your right shoulder, your power by pushing your palm.
+
+### Steam Frame controllers
+
+On SteamVR the mod uses the Steam Frame controllers' own buttons (XR_VALVE_frame_controller_interaction), not the Touch
+remap. Not tested yet.
+
+| Frame button | What it does (the Touch button it stands for) |
+| - | - |
+| Right **A**, **B**, **X**, **Y** | The game's A, B, X, Y, as their letters (Touch's A, B, X, Y). All four are on the right controller |
+| Right **Menu** | Start: the Data menu. With the left grip held: View (as the Touch menu button) |
+| Left **View** | View (Back): switch first / third person; in the star map, missions |
+| Left / right **bumper** | LB / RB, as the thumbrests (the left one a tap: the hand scanner; the right one held: a grenade; in menus the tabs; never both at once). Always on, whatever "Thumbrests as LB/RB" says, also in the Alternative Joy Layout and with the left grip held |
+| Left **D-pad** | The game's D-pad (in menus; in play only with the favorites wheel off, as the D-pad combo) |
+| Sticks, triggers, grips | As on Touch |
+
+- The gestures that use left X and Y on Touch (two quick presses of X put the left weapon away; X held puts your weapons away)
+  are on the right controller's X on the Frame.
+- The right controller at your right temple + right thumbstick click opens the Data menu here too.
+
+### When the menu button does nothing (SteamVR, PlayStation VR2)
+
+Some runtimes keep a controller's menu button for themselves, so the game never gets it:
+- **SteamVR** opens its own dashboard with the left menu button of Touch controllers (Quest through Steam Link, Quest Link
+  with SteamVR, Virtual Desktop in SteamVR mode), and with the Index controllers' system button.
+- **PlayStation VR2** on SteamVR: the PS button opens SteamVR's dashboard, and the Options and Create buttons get nothing in
+  the game by themselves.
+
+Use **the right controller at your right temple + right thumbstick click** for the Data menu (and, in the Data menu, the
+pause menu). It works on every headset. The log (`sfvr_log.txt`) has a `[Headset]` line that says which buttons the menu
+button's action got; when it got none, a warning follows.
+
+Other ways:
+- **Quest:** use a runtime that passes the menu button through: Virtual Desktop's own runtime (VDXR) or Meta Quest Link's.
+- **PlayStation VR2:** bind Options to the mod's menu action in SteamVR. With the game running: press the PS button >
+  Settings > Controllers > Manage Controller Bindings (or "Show old binding UI") > choose Starfield > Custom > Edit this
+  binding. Untick "Mirror mode". On the right controller, Options: "+" > Button > Click > **SystemButton** (in the
+  "Default" set). Save Personal Binding. Then Options opens the Data menu, and the left grip + Options switches first /
+  third person. Press Options briefly: holding it resets your view (Sony's PC app).
 
 ---
 
@@ -540,6 +609,7 @@ here too".)
 | Thumbstick dead zone | 0.15 | How far a stick moves before it counts |
 | Motion controls idle time (s) | 30 s | No button pressed this long: the controllers count as idle |
 | Face buttons as printed | On | Off: the old layout (see above) |
+| Thumbrests as LB/RB | Off | On: the left thumbrest's touch taps LB (the hand scanner), the right one's rest holds RB (a grenade), in menus their tabs (never both at once). The Steam Frame's bumpers and the Index trackpad presses are LB and RB either way |
 | Alternative joy layout | Off | See above |
 | Left-handed (Swap Controller Inputs) | Off | See above |
 | Include AER in the eye-mode button | Off | On: the eye-mode button cycles stereo, mono and AER |

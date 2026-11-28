@@ -42,6 +42,7 @@ const std::string VR::actions_json = R"json(
     { "name": "/actions/default/in/DPad_Down", "type": "boolean" },
     { "name": "/actions/default/in/DPad_Left", "type": "boolean" },
     { "name": "/actions/default/in/SystemButton", "type": "boolean" },
+    { "name": "/actions/default/in/BackButton", "type": "boolean" },
     { "name": "/actions/default/in/Touchpad", "type": "vector2" },
     { "name": "/actions/default/in/TouchpadClick", "type": "boolean" },
     { "name": "/actions/default/out/Haptic", "type": "vibration" }
@@ -70,6 +71,7 @@ const std::string VR::actions_json = R"json(
       "/actions/default/in/DPad_Down": "DPad Down",
       "/actions/default/in/DPad_Left": "DPad Left",
       "/actions/default/in/SystemButton": "System/Menu Button",
+      "/actions/default/in/BackButton": "View Button (Steam Frame)",
       "/actions/default/in/Touchpad": "Touchpad",
       "/actions/default/in/TouchpadClick": "Touchpad Click",
       "/actions/default/out/Haptic": "Haptic"
@@ -287,6 +289,8 @@ std::optional<std::string> VR::initialize_openxr() {
         runtimes::OpenXR::ext_hand_data_source = runtimes::OpenXR::ext_hand_tracking && enable_if_available(XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME);
         // The menu panel's curve (a cylinder layer); without it the panel is flat.
         runtimes::OpenXR::ext_cylinder = enable_if_available(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+        // (fix205) The Steam Frame's controllers' own profile (SteamVR): their bindings are suggested only with it.
+        runtimes::OpenXR::ext_frame_controller = enable_if_available(runtimes::OpenXR::kFrameControllerExtension);
         {
             std::string available_names;
             for (const auto& extension : available) {
@@ -464,6 +468,29 @@ std::optional<std::string> VR::initialize_openxr() {
     }
 
     spdlog::info("[VR] OpenXR system: {} (vendor {})", system_properties.systemName, system_properties.vendorId);
+    // (fix205) The runtime's own name and version (SteamVR says "SteamVR/OpenXR", Virtual Desktop's "VirtualDesktopXR"), kept with the
+    // system's name for the headset report (OpenXR::report_headset).
+    {
+        XrInstanceProperties instance_properties{XR_TYPE_INSTANCE_PROPERTIES};
+        if (const auto ip = xrGetInstanceProperties(m_openxr->instance, &instance_properties); ip == XR_SUCCESS) {
+            m_openxr->runtime_name = std::format("{} {}.{}.{}", instance_properties.runtimeName, XR_VERSION_MAJOR(instance_properties.runtimeVersion),
+                XR_VERSION_MINOR(instance_properties.runtimeVersion), XR_VERSION_PATCH(instance_properties.runtimeVersion));
+        } else {
+            m_openxr->runtime_name = "? (" + m_openxr->get_result_string(ip) + ")";
+        }
+        m_openxr->system_name = system_properties.systemName;
+        spdlog::info("[Headset] (fix205) OpenXR runtime: {}; system: {}", m_openxr->runtime_name, m_openxr->system_name);
+        // (fix205) A Pimax headset (either name, any case): the notice (OpenXR.hpp's kPimaxNotice).
+        {
+            auto lower = m_openxr->runtime_name + " " + m_openxr->system_name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (lower.find("pimax") != std::string::npos) {
+                m_openxr->pimax_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                m_openxr->pimax = true;
+                spdlog::warn("[Headset] (fix205) {}", runtimes::OpenXR::kPimaxNotice);
+            }
+        }
+    }
     spdlog::info("[VR] OpenXR max swapchain {}x{}, {} layers", system_properties.graphicsProperties.maxSwapchainImageWidth,
         system_properties.graphicsProperties.maxSwapchainImageHeight, system_properties.graphicsProperties.maxLayerCount);
     // (fix177) Kept: build mode's console adds its quads only while the frame stays within it.

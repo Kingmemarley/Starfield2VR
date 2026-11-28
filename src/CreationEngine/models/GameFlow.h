@@ -49,6 +49,10 @@ namespace GameFlow {
     // (fix173) A full-screen menu movie set up in the last moments over the whole picture (the star map: 1996x2150): menuBoxRows' 0 then
     // means "no box", not "no box known" (the game's own box is not taken for it).
     bool menuMovieFillsPicture(int backbufferWidth, int backbufferHeight);
+    // (fix205) The Data menu (Interface/DataMenu.swf) is the only full-screen menu set up in the last moments: no other menu of the list
+    // (its Inventory, a message box...) over it. For the Data menu's gesture at the right temple (ModConfig): there it gives Start again,
+    // the pause menu, as the menu button does.
+    bool isOnlyDataMenuShown();
     // The full-screen menus set up in the last moments, by their files (for the log).
     std::string shownMenus();
     // Counts the full-screen menus shown anew (opened, or another tab of one).

@@ -56,6 +56,13 @@ namespace TempleGestures
         // (fix143's review: the box is large; a trigger already held as the hand came into it (a gun fired beside the head) stays the
         // game's.)
         std::atomic<bool>    g_entered_held[2]{ false, false };
+        // (fix205) Each controller beside its own side's temple now ([0] the left controller in your hands, [1] the right), in the same box as
+        // the gestures above, whatever the game shows and whether the temple gestures are on: for the Data menu at the right temple (ModConfig),
+        // which decides itself where it may be used.
+        std::atomic<bool>    g_zone[2]{ false, false };
+        std::atomic<float>   g_zone_at[2][3]{}; // (where that controller was, in the box's axes: for the log)
+        std::atomic<int64_t> g_zone_us[2]{ 0, 0 }; // (when that was found: older than kZoneFresh, not counted; the review)
+        constexpr int64_t    kZoneFresh = 150'000;
         bool                 g_was_there[2]{ false, false };
         bool                 g_trigger_down[2]{ false, false };
         int                  g_uses[2]{ 0, 0 };
@@ -465,8 +472,18 @@ namespace TempleGestures
             const float     height = glm::dot(d, up);
             const float     ahead  = glm::dot(d, forward);
             const bool      known  = std::isfinite(at.x);
-            const bool      there  = play && known && side >= kSideMin && side <= kSideMax && height >= kUpMin && height <= kUpMax &&
+            const bool      in_box = known && std::isfinite(eyes.x) && side >= kSideMin && side <= kSideMax && height >= kUpMin && height <= kUpMax &&
                                 ahead >= kForwardMin && ahead <= kForwardMax;
+            const bool      there  = play && in_box;
+            // (fix205) The same box for the Data menu's gesture, by the controller in your hands, with the headset on and the controllers in use.
+            {
+                const int physical = yours_left ? 0 : 1;
+                g_zone[physical]   = in_box && vr->is_hmd_active() && vr->is_using_controllers();
+                g_zone_at[physical][0] = side;
+                g_zone_at[physical][1] = height;
+                g_zone_at[physical][2] = ahead;
+                g_zone_us[physical]    = NowUs();
+            }
             if (there && !g_was_there[hand]) {
                 g_entered_held[hand] = down && !pulled;
             }
@@ -537,6 +554,22 @@ namespace TempleGestures
                 spdlog::error("[Temple] (fix174) the flashlight's light could not be read: it is left as the game has it for this session");
             }
         }
+    }
+
+    bool AtOwnTemple(bool physical_left, float* side, float* up, float* ahead)
+    {
+        const int physical = physical_left ? 0 : 1;
+        if (side != nullptr) {
+            *side = g_zone_at[physical][0].load();
+        }
+        if (up != nullptr) {
+            *up = g_zone_at[physical][1].load();
+        }
+        if (ahead != nullptr) {
+            *ahead = g_zone_at[physical][2].load();
+        }
+        // (Found in a frame within the last kZoneFresh: a frame step not run for a while, a load, a pause, is no hand at the temple.)
+        return g_zone[physical].load() && NowUs() - g_zone_us[physical].load() < kZoneFresh;
     }
 
     bool HoldsTrigger(bool left)

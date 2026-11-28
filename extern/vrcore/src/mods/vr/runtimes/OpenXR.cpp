@@ -469,6 +469,11 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
                     }
                 }
             }
+        } else if (bh->type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            // (fix205) The controllers changed (or were first taken as some controller): the headset report a moment later, once for the
+            // burst (the runtime sends one event per hand and often a few more right after).
+            this->headset_report_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 500;
+            this->headset_report_wanted = true;
         } else if (bh->type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             this->wants_reset_origin = true;
             if (this->space_change_logs++ < 20) {
@@ -542,7 +547,187 @@ VRRuntime::Error OpenXR::update_input() {
     }
     this->input_synced = true; // (fix189) the actions' state is this focus's
 
+    // (fix205) The headset report: a second after the first sync made while focused, and half a second after each burst of the runtime's
+    // profile-changed events (consume_events). Only reads the runtime's answers; a handful of calls each time.
+    {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!this->headset_report_started) {
+            this->headset_report_started = true;
+            if (!this->headset_report_wanted.load()) {
+                this->headset_report_at_ms = now_ms + 1000;
+                this->headset_report_wanted = true;
+            }
+        }
+        if (now_ms >= this->headset_report_at_ms.load() && this->headset_report_wanted.exchange(false)) {
+            this->report_headset(this->headset_reports == 0 ? "at start" : "the controllers changed");
+        }
+    }
+
     const auto current_interaction_profile = this->get_current_interaction_profile();
+    // (fix205) Either hand's controller taken as the Steam Frame's (only looked at with its extension enabled: two cheap calls a sync).
+    {
+        bool frame = false;
+        if (ext_frame_controller) {
+            if (this->frame_profile_path == XR_NULL_PATH) {
+                xrStringToPath(this->instance, kFrameControllerProfile, &this->frame_profile_path);
+            }
+            for (int i = 0; i < 2 && this->frame_profile_path != XR_NULL_PATH; ++i) {
+                XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+                if (xrGetCurrentInteractionProfile(this->session, this->hands[i].path, &state) == XR_SUCCESS &&
+                    state.interactionProfile == this->frame_profile_path) {
+                    frame = true;
+                }
+            }
+        }
+        this->frame_controllers_now = frame;
+    }
+
+    // (fix207) The Index controllers' grip button and trackpad presses (OpenXR.hpp), and the 10 s trigger and grip values line. A few
+    // cheap calls a sync (each hand's profile, its trigger and grip values and buttons, an Index's pad).
+    {
+        if (this->index_profile_path == XR_NULL_PATH) {
+            xrStringToPath(this->instance, kIndexControllerProfile, &this->index_profile_path);
+        }
+        const bool steamvr = this->runtime_name.starts_with("SteamVR/OpenXR");
+        auto read_float = [&](XrAction action, XrPath hand_path, float& value) -> bool {
+            if (action == XR_NULL_HANDLE) {
+                return false;
+            }
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = action;
+            info.subactionPath = hand_path;
+            XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+            if (xrGetActionStateFloat(this->session, &info, &state) != XR_SUCCESS || state.isActive != XR_TRUE) {
+                return false;
+            }
+            value = std::isfinite(state.currentState) ? state.currentState : 0.0f;
+            return true;
+        };
+        auto read_button = [&](XrAction action, XrPath hand_path) -> bool {
+            if (action == XR_NULL_HANDLE) {
+                return false;
+            }
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = action;
+            info.subactionPath = hand_path;
+            XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+            return xrGetActionStateBoolean(this->session, &info, &state) == XR_SUCCESS && state.isActive == XR_TRUE &&
+                   state.currentState == XR_TRUE;
+        };
+        bool pads = false;
+        for (int i = 0; i < 2; ++i) {
+            const XrPath hand_path = this->hands[i].path;
+            XrPath profile = XR_NULL_PATH;
+            {
+                XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+                if (xrGetCurrentInteractionProfile(this->session, hand_path, &state) == XR_SUCCESS) {
+                    profile = state.interactionProfile;
+                }
+            }
+            const bool index = this->index_profile_path != XR_NULL_PATH && profile == this->index_profile_path;
+            // (The review) A new profile for this hand: whether it gives real values is found again (get_finger_input's fallback).
+            if (profile != this->hand_profile_now[i]) {
+                this->hand_profile_now[i] = profile;
+                this->trigger_value_seen[i] = false;
+                this->grip_value_seen[i] = false;
+            }
+
+            // The grip button from the squeeze value (not on SteamVR): on past kIndexGripOn, off below kIndexGripOff. (The review) A sync
+            // whose value could not be read keeps the last state: one missed read does not let go of a held grip.
+            float grip = 0.0f;
+            const bool grip_value = read_float(this->finger_grip_action, hand_path, grip);
+            const bool grip_from_was = this->grip_from_value[i].load();
+            if (!index || steamvr) {
+                this->grip_from_value[i] = false;
+                this->grip_value_down[i] = false;
+            } else if (grip_value) {
+                const bool was_down = this->grip_value_down[i].load();
+                this->grip_value_down[i] = was_down ? grip > kIndexGripOff : grip > kIndexGripOn;
+                this->grip_from_value[i] = true;
+            }
+
+            // The trackpad's press: on past kIndexPadOn, off below kIndexPadOff (also on SteamVR: a press, not a setting). A missed read
+            // keeps the last state, as the grip's.
+            float pad = 0.0f;
+            const bool pad_read = index && read_float(this->trackpad_force_action, hand_path, pad);
+            if (!index) {
+                this->index_pad_live[i] = false;
+                this->index_pad_down[i] = false;
+            } else if (pad_read) {
+                const bool pad_was = this->index_pad_down[i].load();
+                this->index_pad_down[i] = pad_was ? pad > kIndexPadOff : pad > kIndexPadOn;
+                this->index_pad_live[i] = true;
+            }
+            const bool pad_live = this->index_pad_live[i].load();
+            pads = pads || pad_live;
+
+            // (The review) Each change of where this hand's grip button comes from, logged (with the controller's below).
+            if (this->grip_from_value[i].load() != grip_from_was && this->index_hand[i].load() == index && this->index_hand_logs < 12) {
+                ++this->index_hand_logs;
+                spdlog::info("[Input] (fix207) the {} hand's grip button now {}", i == 0 ? "left" : "right",
+                    this->grip_from_value[i].load() ? "made from its squeeze value (on past 0.75, off below 0.40)" : "the runtime's own");
+            }
+
+            if (index != this->index_hand[i].load()) {
+                this->index_hand[i] = index;
+                if (this->index_hand_logs < 12) {
+                    ++this->index_hand_logs;
+                    if (index) {
+                        spdlog::info("[Input] (fix207) the {} hand's controller is taken as an Index: its grip button {}; its trackpad's press {}",
+                            i == 0 ? "left" : "right",
+                            steamvr ? "as SteamVR's controller bindings make it"
+                                    : (grip_value ? "made from its squeeze value (on past 0.75, off below 0.40, as the grabs)"
+                                                  : "the runtime's own (no squeeze value given)"),
+                            pad_live ? (i == 0 ? "is LB (the left thumbrest's)" : "is RB (the right thumbrest's)") : "not given by the runtime");
+                    } else {
+                        spdlog::info("[Input] (fix207) the {} hand's controller is no longer taken as an Index", i == 0 ? "left" : "right");
+                    }
+                }
+            }
+
+            // The values line's peaks (the runtime's own buttons, not the one made here).
+            float trigger = 0.0f;
+            read_float(this->finger_trigger_action, hand_path, trigger);
+            if (trigger > 0.1f) {
+                this->trigger_value_seen[i] = true;
+            }
+            if (grip > 0.1f) {
+                this->grip_value_seen[i] = true;
+            }
+            auto& peak = this->input_peaks[i];
+            peak.trigger = std::max(peak.trigger, trigger);
+            peak.grip    = std::max(peak.grip, grip);
+            peak.pad     = std::max(peak.pad, pad);
+            if (read_button(this->trigger_action, hand_path)) {
+                ++peak.trigger_down;
+            }
+            if (read_button(this->grip_action, hand_path)) {
+                ++peak.grip_down;
+            }
+        }
+        this->index_pads_now = pads;
+
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (this->input_peaks_since_ms == 0) {
+            this->input_peaks_since_ms = now_ms;
+        } else if (now_ms - this->input_peaks_since_ms >= 10000) {
+            const auto& l = this->input_peaks[0];
+            const auto& r = this->input_peaks[1];
+            const bool used = l.trigger > 0.05f || l.grip > 0.05f || l.trigger_down > 0 || l.grip_down > 0 || l.pad > 0.05f ||
+                              r.trigger > 0.05f || r.grip > 0.05f || r.trigger_down > 0 || r.grip_down > 0 || r.pad > 0.05f;
+            if (used && this->input_peak_logs < kInputPeakLogs) {
+                ++this->input_peak_logs;
+                const bool any_index = this->index_hand[0].load() || this->index_hand[1].load();
+                spdlog::info("[Input] (fix207) the last 10 s, the highest values the runtime gave: left trigger {:.2f} (its button down {} syncs), "
+                             "grip {:.2f} (button {}); right trigger {:.2f} (button {}), grip {:.2f} (button {}){}",
+                    l.trigger, l.trigger_down, l.grip, l.grip_down, r.trigger, r.trigger_down, r.grip, r.grip_down,
+                    any_index ? fmt::format("; the Index trackpads' press left {:.2f}, right {:.2f}", l.pad, r.pad) : std::string{});
+            }
+            this->input_peaks[0] = {};
+            this->input_peaks[1] = {};
+            this->input_peaks_since_ms = now_ms;
+        }
+    }
 
     for (auto i = 0; i < 2; ++i) {
         auto& hand = this->hands[i];
@@ -858,6 +1043,27 @@ OpenXR::FingerInput OpenXR::get_finger_input(VRRuntime::Hand hand) const {
     read_float("fingergrip", out.grip);
     read_bool("fingertriggertouch", out.trigger_touch);
     read_bool("fingerthumbtouch", out.thumb_touch);
+    // (fix207) A runtime that gives the trigger's or grip's button but no value (the value reads nothing with the button down): the button
+    // counts as the whole value, so what reads the value (the temples' scanner and flashlight, grabs, climbing, the fingers) still works.
+    // The runtime's own buttons, read only while the value is near nothing, and (the review) only for a hand whose controller has given no
+    // real value since it was taken as its current profile (update_input). So Vive wands and Windows Mixed Reality controllers, whose grip
+    // is a click only, now have their grip's click as a full squeeze: grabs and climbing work with them (before, their grip value stayed 0).
+    auto button = [&](XrAction action) {
+        if (action == XR_NULL_HANDLE) {
+            return false;
+        }
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = action;
+        info.subactionPath = path;
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        return xrGetActionStateBoolean(this->session, &info, &state) == XR_SUCCESS && state.isActive == XR_TRUE && state.currentState == XR_TRUE;
+    };
+    if (out.trigger <= 0.05f && !this->trigger_value_seen[hand].load() && button(this->trigger_action)) {
+        out.trigger = 1.0f;
+    }
+    if (out.grip <= 0.05f && !this->grip_value_seen[hand].load() && button(this->grip_action)) {
+        out.grip = 1.0f;
+    }
     return out;
 }
 
@@ -925,6 +1131,135 @@ XrPath OpenXR::get_current_interaction_profile_path() const {
     return state.interactionProfile;
 }
 
+// (fix205) Which physical buttons an action got now, by the runtime's own names for them (and their paths): "none" when it got none, "?"
+// when the runtime could not say.
+std::string OpenXR::bound_sources(XrAction action, uint32_t& count, bool localized) const {
+    count = 0;
+    if (action == XR_NULL_HANDLE || this->session == XR_NULL_HANDLE) {
+        return "?";
+    }
+
+    XrBoundSourcesForActionEnumerateInfo info{XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO};
+    info.action = action;
+    uint32_t n = 0;
+    if (auto result = xrEnumerateBoundSourcesForAction(this->session, &info, 0, &n, nullptr); result != XR_SUCCESS) {
+        return "? (" + this->get_result_string(result) + ")";
+    }
+
+    std::vector<XrPath> sources(n, XR_NULL_PATH);
+    if (n > 0) {
+        if (auto result = xrEnumerateBoundSourcesForAction(this->session, &info, n, &n, sources.data()); result != XR_SUCCESS) {
+            return "? (" + this->get_result_string(result) + ")";
+        }
+        sources.resize(std::min<size_t>(n, sources.size()));
+    }
+
+    count = (uint32_t)sources.size();
+    if (sources.empty()) {
+        return "none";
+    }
+
+    std::string out{};
+    for (const auto source : sources) {
+        if (!out.empty()) {
+            out += ", ";
+        }
+
+        std::string name{};
+        if (localized) {
+            XrInputSourceLocalizedNameGetInfo name_info{XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO};
+            name_info.sourcePath = source;
+            name_info.whichComponents = XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT | XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |
+                                        XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
+            uint32_t length = 0;
+            if (xrGetInputSourceLocalizedName(this->session, &name_info, 0, &length, nullptr) == XR_SUCCESS && length > 1) {
+                std::string buffer(length, '\0');
+                if (xrGetInputSourceLocalizedName(this->session, &name_info, length, &length, buffer.data()) == XR_SUCCESS) {
+                    buffer.resize(std::min<size_t>(length > 0 ? length - 1 : 0, buffer.size()));
+                    name = buffer.c_str(); // (up to its end mark)
+                }
+            }
+        }
+
+        const auto path = this->get_path_string(source);
+        out += name.empty() ? path : name + " (" + path + ")";
+    }
+
+    return out;
+}
+
+// (fix205) The headset report (see OpenXR.hpp): the runtime, the headset, each hand's controller as the runtime takes it, the physical
+// buttons the menu button's action got (with a warning when none: the game's Start then comes from nowhere), and every action's buttons.
+void OpenXR::report_headset(const char* why) {
+    if (this->headset_reports >= kHeadsetReports || this->session == XR_NULL_HANDLE) {
+        return;
+    }
+    ++this->headset_reports;
+
+    std::string profiles[2]{};
+    bool any_controller = false;
+    for (int i = 0; i < 2; ++i) {
+        XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+        if (auto result = xrGetCurrentInteractionProfile(this->session, this->hands[i].path, &state); result != XR_SUCCESS) {
+            profiles[i] = "? (" + this->get_result_string(result) + ")";
+        } else if (state.interactionProfile == XR_NULL_PATH) {
+            profiles[i] = "none yet";
+        } else {
+            profiles[i] = this->get_path_string(state.interactionProfile);
+            any_controller = true;
+        }
+    }
+
+    uint32_t menu_count = 0;
+    std::string menu = "? (no such action)";
+    if (const auto it = this->action_set.action_map.find("systembutton"); it != this->action_set.action_map.end()) {
+        menu = this->bound_sources(it->second, menu_count, true);
+    }
+
+    spdlog::info("[Headset] (fix205) {}: runtime {}, system {}; the left hand's controller is taken as {}, the right hand's as {}; the menu "
+                 "button's action (the game's Start: the Data menu; with the left grip held, Back) is on: {}",
+        why, this->runtime_name.empty() ? "?" : this->runtime_name, this->system_name.empty() ? "?" : this->system_name, profiles[0], profiles[1], menu);
+
+    if (any_controller && menu_count == 0 && menu == "none") {
+        spdlog::warn("[Headset] (fix205) the controller's menu button doesn't reach the game here (e.g. SteamVR keeps it for its dashboard): use the "
+                     "right controller at your right temple + the right stick click for the Data menu (or bind a button to the SystemButton action "
+                     "in the runtime's controller bindings)");
+    } else if (any_controller && this->runtime_name.starts_with("SteamVR/OpenXR")) {
+        // (fix205, the review) SteamVR says the menu button is bound, but keeps Touch's left menu button and Index's system button for its
+        // own dashboard: the game gets nothing from them either.
+        for (const auto& profile : profiles) {
+            if (profile == "/interaction_profiles/oculus/touch_controller" || profile == "/interaction_profiles/valve/index_controller") {
+                spdlog::warn("[Headset] (fix205) SteamVR keeps {} for its dashboard: use the right controller at your right temple + the right "
+                             "stick press for the Data menu",
+                    profile == "/interaction_profiles/oculus/touch_controller" ? "the Touch left menu button" : "the Index system button");
+                break;
+            }
+        }
+    }
+
+    // Every action's buttons (one line), the poses and the vibration left out: for a controller the mod was not made with, what each of its
+    // buttons does here.
+    std::vector<std::pair<std::string, XrAction>> actions{};
+    for (const auto& [name, action] : this->action_set.action_map) {
+        if (name == "pose" || name == "aimpose" || name == "haptic") {
+            continue;
+        }
+        actions.emplace_back(name, action);
+    }
+    std::sort(actions.begin(), actions.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::string all{};
+    for (const auto& [name, action] : actions) {
+        uint32_t count = 0;
+        const auto sources = this->bound_sources(action, count, false);
+        if (!all.empty()) {
+            all += "; ";
+        }
+        all += name + ": " + sources;
+    }
+    spdlog::info("[Headset] (fix205) each action's buttons now: {}", all.empty() ? "(no actions)" : all);
+}
+
 std::optional<std::string> OpenXR::initialize_actions(const std::string& json_string) {
     spdlog::info("[VR] Initializing actions");
 
@@ -979,6 +1314,10 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
     }
 
     auto attempt_add_binding = [&](const std::string& interaction_profile, const XrActionSuggestedBinding& binding) -> bool {
+        // (fix205) The Steam Frame's profile only with its extension enabled (any other runtime would refuse each of its bindings).
+        if (interaction_profile == kFrameControllerProfile && !ext_frame_controller) {
+            return false;
+        }
         XrPath interaction_profile_path{};
         auto result = xrStringToPath(this->instance, interaction_profile.c_str(), &interaction_profile_path);
         auto& bindings = profile_bindings[interaction_profile];
@@ -995,7 +1334,9 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
 
             if (result != XR_SUCCESS) {
                 bindings.pop_back();
-                spdlog::info("Bad binding passed to xrSuggestInteractionProfileBindings from {}: {}", interaction_profile, this->get_result_string(result));
+                // (fix207) With the refused path: the extra actions below have no path line of their own before their refusals.
+                spdlog::info("Bad binding passed to xrSuggestInteractionProfileBindings from {}: {} ({})", interaction_profile,
+                    this->get_result_string(result), this->get_path_string(binding.binding));
                 return false;
             }
 
@@ -1145,10 +1486,43 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
         return "json missing pose action";
     }
 
+    // (fix205) The Steam Frame's own buttons (OpenXR.hpp's s_frame_bindings), for its profile alone.
+    if (ext_frame_controller) {
+        int added = 0, refused = 0;
+        for (const auto& binding : s_frame_bindings) {
+            const auto action_it = this->action_set.action_map.find(binding.action_name);
+            if (action_it == this->action_set.action_map.end()) {
+                ++refused;
+                continue;
+            }
+            XrPath p{XR_NULL_PATH};
+            if (xrStringToPath(this->instance, binding.interaction_path_name.c_str(), &p) != XR_SUCCESS || p == XR_NULL_PATH) {
+                ++refused;
+                continue;
+            }
+            const auto index = binding.interaction_path_name.find("/left/") != std::string::npos ? VRRuntime::Hand::LEFT : VRRuntime::Hand::RIGHT;
+            spdlog::info("[VR] (fix205) Steam Frame: {} -> {}", binding.interaction_path_name, binding.action_name);
+            if (attempt_add_binding(kFrameControllerProfile, {action_it->second, p})) {
+                this->hands[index].profiles[kFrameControllerProfile].path_map[binding.action_name] = p;
+                ++added;
+            } else {
+                ++refused;
+            }
+        }
+        spdlog::info("[VR] (fix205) the Steam Frame's controllers: {} of their own buttons bound, {} not taken (logged above)", added, refused);
+    }
+
     // Check for json files that will override the default suggested bindings
     for (const auto& controller : s_supported_controllers) {
         // Create default action vector associations
+        // (fix207) Only for the controllers whose touchpad stands in for face buttons (Vive wands, Windows Mixed Reality, Oculus Go): the
+        // others have real face buttons, and a runtime that took a touchpad click for them would have pressed A, B or a stick click as well.
+        const bool pad_buttons = controller == "/interaction_profiles/htc/vive_controller" || controller == "/interaction_profiles/microsoft/motion_controller" ||
+                                 controller == "/interaction_profiles/oculus/go_controller";
         for (const auto& association : s_action_vector_associations) {
+            if (!pad_buttons) {
+                break;
+            }
             auto& hand = this->hands[association.hand];
             auto& hand_profile = hand.profiles[controller];
             auto& action_map = this->action_set.action_map;
@@ -1259,17 +1633,38 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
             if (type == XR_ACTION_TYPE_POSE_INPUT) {
                 this->action_set.pose_actions.insert(action);
             }
+            // (fix207) One line per action: each path and how many of the controllers tried took it (the refusals above name the path).
+            std::string taken{};
             for (auto i = 0; i < 2; ++i) {
                 const std::string hand = i == VRRuntime::Hand::LEFT ? "/user/hand/left/input/" : "/user/hand/right/input/";
                 for (const auto* component : components) {
+                    // (fix207) X and Y are left-hand buttons on every controller here but the Steam Frame's (all four letters on its right
+                    // controller): the right hand's X and Y are suggested to its profile alone (the others refused them, six lines a time).
+                    const bool right_xy = i == VRRuntime::Hand::RIGHT && (std::strncmp(component, "x/", 2) == 0 || std::strncmp(component, "y/", 2) == 0);
                     XrPath p{XR_NULL_PATH};
                     if (xrStringToPath(this->instance, (hand + component).c_str(), &p) != XR_SUCCESS) {
                         continue;
                     }
+                    int tried = 0, took = 0;
                     for (const auto& controller : s_supported_controllers) {
-                        attempt_add_binding(controller, {action, p});
+                        if (right_xy && controller != kFrameControllerProfile) {
+                            continue;
+                        }
+                        if (controller == kFrameControllerProfile && !ext_frame_controller) {
+                            continue; // (never suggested without its extension: attempt_add_binding)
+                        }
+                        ++tried;
+                        if (attempt_add_binding(controller, {action, p})) {
+                            ++took;
+                        }
+                    }
+                    if (tried > 0) {
+                        taken += fmt::format("{}{}{} ({} of {})", taken.empty() ? "" : ", ", hand, component, took, tried);
                     }
                 }
+            }
+            if (!taken.empty()) {
+                spdlog::info("[VR] (fix207) extra action {}: {}", name, taken);
             }
             return action;
         };
@@ -1279,6 +1674,42 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
         create_extra("fingertriggertouch", XR_ACTION_TYPE_BOOLEAN_INPUT, {"trigger/touch"});
         create_extra("fingerthumbtouch", XR_ACTION_TYPE_BOOLEAN_INPUT,
             {"thumbstick/touch", "thumbrest/touch", "a/touch", "b/touch", "x/touch", "y/touch"});
+
+        // (fix207) The Index controllers' trackpad press (OpenXR.hpp's s_index_bindings), for their profile alone.
+        if (const XrAction pad = create_extra("trackpadforce", XR_ACTION_TYPE_FLOAT_INPUT, {}); pad != XR_NULL_HANDLE) {
+            std::string taken{};
+            for (const auto& binding : s_index_bindings) {
+                XrPath p{XR_NULL_PATH};
+                if (xrStringToPath(this->instance, binding.interaction_path_name.c_str(), &p) != XR_SUCCESS || p == XR_NULL_PATH) {
+                    continue;
+                }
+                const bool took = attempt_add_binding(kIndexControllerProfile, {pad, p});
+                taken += fmt::format("{}{} {}", taken.empty() ? "" : ", ", binding.interaction_path_name, took ? "taken" : "refused");
+            }
+            spdlog::info("[VR] (fix207) the Index controllers' trackpad press (LB on the left, RB on the right): {}", taken.empty() ? "none" : taken);
+        }
+    }
+
+    // (fix207) The actions update_input, is_action_active and get_finger_input look at by handle.
+    {
+        auto handle = [&](const char* name) {
+            const auto it = this->action_set.action_map.find(name);
+            return it != this->action_set.action_map.end() ? it->second : XR_NULL_HANDLE;
+        };
+        this->grip_action           = handle("grip");
+        this->trigger_action        = handle("trigger");
+        this->finger_grip_action    = handle("fingergrip");
+        this->finger_trigger_action = handle("fingertrigger");
+        this->trackpad_force_action = handle("trackpadforce");
+        this->thumbrest_actions[0]  = handle("thumbresttouchleft");
+        this->thumbrest_actions[1]  = handle("thumbresttouchright");
+        // (Each is only read as what it is: "grip", "trigger" and the thumbrests as buttons, the others as values.)
+        if (this->grip_action != XR_NULL_HANDLE && !this->action_set.bool_actions.contains(this->grip_action)) {
+            this->grip_action = XR_NULL_HANDLE;
+        }
+        if (this->trigger_action != XR_NULL_HANDLE && !this->action_set.bool_actions.contains(this->trigger_action)) {
+            this->trigger_action = XR_NULL_HANDLE;
+        }
     }
 
     // Create the action spaces for each hand
@@ -1322,6 +1753,17 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
 bool OpenXR::is_action_active(XrAction action, VRRuntime::Hand hand) const {
     if (hand > VRRuntime::Hand::RIGHT || !this->input_focused()) { // (fix189: nothing held while not focused)
         return false;
+    }
+
+    // (fix207) An Index: its grip button made from the squeeze value, and its trackpad's press as that hand's thumbrest action (the other
+    // hand's thumbrest action is never this hand's: the Index has no thumbrest to give it). Worked out at the last sync (update_input).
+    if (action != XR_NULL_HANDLE) {
+        if (action == this->grip_action && this->grip_from_value[hand].load()) {
+            return this->grip_value_down[hand].load();
+        }
+        if ((action == this->thumbrest_actions[0] || action == this->thumbrest_actions[1]) && this->index_pad_live[hand].load()) {
+            return action == this->thumbrest_actions[hand] && this->index_pad_down[hand].load();
+        }
     }
 
     if (auto it = this->hands[hand].forced_actions.find(action); it != this->hands[hand].forced_actions.end()) {
@@ -2197,6 +2639,12 @@ XrResult OpenXR::end_frame() {
     const bool last_image_ready = this->swapchains.size() >= 2 && this->image_ready[1];
     if (!this->panel_mode) {
         this->panel_placed = false; // (the next menu's panel is put in front of you)
+        // (fix207) A recenter while no menu is up starts its half second now, not as the next menu opens: kept, the next menu to open, even
+        // long after (the recenter after a loading screen), followed your head for its first half second. (The review) A menu opening within
+        // that half second is still put in front of you again as the room's space settles.
+        if (this->panel_recenter.exchange(false)) {
+            this->panel_replace_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        }
     }
     const bool panel_ready = render && this->panel_mode && !this->panel_refused && this->panel_image_ready &&
                              this->panel_swapchain != XR_NULL_HANDLE && this->panel_image_width > 0 && this->panel_image_height > 0 &&

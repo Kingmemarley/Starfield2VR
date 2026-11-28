@@ -461,6 +461,7 @@ public:
     ActionHandle m_action_dpad_down{};
     ActionHandle m_action_dpad_left{};
     ActionHandle m_action_system_button{};
+    ActionHandle m_action_back_button{}; // (fix205) the game's View (Back) by itself: the Steam Frame's View button
     ActionHandle m_action_touchpad{};
     ActionHandle m_action_touchpad_click{};
     ActionHandle m_action_haptic{};
@@ -482,6 +483,7 @@ public:
         {"/actions/default/in/DPad_Down", m_action_dpad_down},
         {"/actions/default/in/DPad_Left", m_action_dpad_left},
         {"/actions/default/in/SystemButton", m_action_system_button},
+        {"/actions/default/in/BackButton", m_action_back_button},
         {"/actions/default/in/Touchpad", m_action_touchpad},
         {"/actions/default/in/TouchpadClick", m_action_touchpad_click},
         {"/actions/default/out/Haptic", m_action_haptic},

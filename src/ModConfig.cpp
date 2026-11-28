@@ -24,6 +24,7 @@
 #include "CreationEngine/LadderClimb.h"
 #include "CreationEngine/Climbing.h"
 #include "CreationEngine/Physical.h"
+#include "CreationEngine/Haptics.h"
 
 namespace ModSettings {
     // HudScale g_hudScale;
@@ -237,7 +238,94 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     // only (its window's close button closes it too): both sticks clicked together no longer toggle it, now that the everyday settings
     // are in the game's own Settings > VR tab. So each click goes to the game as it is, also both together, with no wait to see whether
     // the other stick joins it (before, a click was held back 100 ms for that, and one down together with the other's went nowhere).
-    const bool send_stick_click[2]{ is_left_joystick_click_down, is_right_joystick_click_down }; // left, right
+    bool send_stick_click[2]{ is_left_joystick_click_down, is_right_joystick_click_down }; // left, right
+    bool temple_start_tap       = false; // (fix205, below) Start tapped for the game now: the Data menu at your right temple
+    bool temple_click_taken     = false; // ...the right controller's click is that gesture's until let go
+    bool temple_click_game_left = false; // ...and it is the game's left stick click (Swap Controller Inputs)
+
+    // (fix205) The Data menu at your right temple: the right controller in your hands held beside the right side of your head (the same box as
+    // the scanner's trigger gesture there, TempleGestures) and its thumbstick clicked gives the game a tap of Start (the Data menu) instead of
+    // the click. For headsets whose menu button never reaches the game (SteamVR keeps the Touch left menu button for its own dashboard, and the
+    // PlayStation VR2 Sense's Options button gets nothing by itself there), and it works on every headset. Only a click that begins with the
+    // controller there is taken, judged as it goes down: a click anywhere else (melee, sprint) reaches the game at once, as before, with no
+    // wait. A taken click is kept from the game until it is let go. In the Data menu itself (no other menu over it) it gives Start again, the
+    // pause menu, as the menu button does there. Not taken in any other menu (the click is the menu's), the mod's menu, a conversation, build mode,
+    // the favorites menu or wheel, the hand scanner, on a loading screen; nor with the left grip held (left grip + right stick click
+    // is the eye-mode switch; with Swap Controller Inputs the right controller's grip with its click is the flat screen's), the right grip held,
+    // the temple's own trigger gesture under way (its trigger held back, or its LB being sent), or that hand holding something, a person, a
+    // wall or a ladder, a grenade, a power just pushed out, or its thrown melee weapon away. The
+    // controller is the one in your right hand whatever Swap Controller Inputs says (the temples do not swap): with it on, its click is the
+    // game's left stick click (sprint), and that is the one kept. A short buzz in that controller.
+    {
+        struct TempleMenu {
+            bool                                  was_down{ false };
+            bool                                  taken{ false };
+            int                                   game_click{ 1 }; // (the game's stick click it took: kept while held)
+            std::chrono::steady_clock::time_point start_until{};
+            int                                   logs{ 0 };
+            int                                   refused_logs{ 0 };
+        };
+        static TempleMenu tm{};
+        constexpr auto    kStartTap = std::chrono::milliseconds(90);
+        // The right controller in your hands: its click and grip; which of the game's stick clicks its click is.
+        const bool  down       = is_action_active(m_action_joystick_click, get_right_joystick());
+        const int   click_now  = wants_swap ? 0 : 1; // (send_stick_click's index: 0 the game's left, 1 its right)
+        const bool  pressed    = down && !tm.was_down;
+        tm.was_down            = down;
+        if (!down) {
+            tm.taken = false;
+        }
+        float side = 0.0f, up = 0.0f, ahead = 0.0f;
+        if (pressed && TempleGestures::AtOwnTemple(false, &side, &up, &ahead)) {
+            // (The game's hand this controller is: its left with Swap Controller Inputs.)
+            const bool  hand_left = wants_swap;
+            const char* refused   = g_framework->is_drawing_ui()                                    ? "the mod's menu is open"
+                                    : GameFlow::isShowingMenu() && !GameFlow::isOnlyDataMenuShown() ? "a menu other than the Data menu is shown (the click is the menu's)"
+                                    : GameFlow::isInDialogue() || GameFlow::isDialogueDrawnNow()     ? "in a conversation"
+                                    : GameFlow::isWorkshopShown()                                    ? "in build mode"
+                                    : GameFlow::isFavoritesShown() || FavoritesWheel::IsOpen()       ? "the favorites are open"
+                                    : GameFlow::isScannerOpen()                                      ? "the hand scanner is open"
+                                    : GameFlow::isLoadingScreenShown()                               ? "a loading screen"
+                                    // (The review: the left controller's grip, without Swap Controller Inputs: left grip + right stick click is the
+                                    // eye-mode switch. With it on this click is the game's left one, whose combo is the right controller's own grip.)
+                                    : !wants_swap && is_action_active(m_action_grip, get_left_joystick()) ? "the left grip is held (left grip + right stick click: the eye mode)"
+                                    : is_action_active(m_action_grip, get_right_joystick())
+                                        ? (wants_swap ? "the right grip is held (with Swap Controller Inputs, its grip + this click: the flat screen)"
+                                                      : "the right grip is held")
+                                    : TempleGestures::HoldsTrigger(hand_left) || TempleGestures::PressLeftShoulder() ? "the temple's trigger gesture is under way"
+                                    : HandGrab::HoldingWith(hand_left) || HandGrab::Deciding(hand_left) ? "the right hand holds something"
+                                    : Physical::HoldingPerson(hand_left)                             ? "the right hand holds a person"
+                                    : Climbing::Active() || Climbing::HoldsGrip(hand_left) || GameFlow::isOnLadder() ? "climbing"
+                                    : HandActions::GrenadeInHand() || HandActions::OwnsGrenadeButton() ? "a grenade in hand"
+                                    : HandActions::PowerAimActive()                                  ? "a power just pushed out"
+                                    : MeleeThrow::Away(hand_left)                                    ? "its thrown melee weapon is away"
+                                                                                                     : nullptr;
+            if (refused == nullptr) {
+                tm.taken       = true;
+                tm.game_click  = click_now;
+                tm.start_until = now + kStartTap;
+                haptics::MeleePulse(hand_left, 0.4f, 0.06f); // (MeleePulse takes the game's hand: this controller)
+                if (tm.logs < 20) {
+                    ++tm.logs;
+                    spdlog::info("[Temple] (fix205) the right stick clicked with the right controller at your right temple ({:.2f} out, {:.2f} up, {:.2f} "
+                                 "ahead): Start tapped for the game ({}), the click ({}) kept from it until let go",
+                        side, up, ahead, GameFlow::isShowingMenu() ? "in the Data menu: the pause menu" : "the Data menu", click_now == 1 ? "melee" : "sprint, the game's left stick with Swap Controller Inputs");
+                }
+            } else if (tm.refused_logs < 20) {
+                ++tm.refused_logs;
+                spdlog::info("[Temple] (fix205) the right stick clicked at your right temple ({:.2f} out, {:.2f} up, {:.2f} ahead), not taken for the Data "
+                             "menu: {}; the click goes to the game as it is",
+                    side, up, ahead, refused);
+            }
+        }
+        if (tm.taken) {
+            send_stick_click[tm.game_click] = false;
+        }
+        // The tap itself: added after the menu button's Start and Back below (which set both each poll).
+        temple_start_tap = now < tm.start_until;
+        temple_click_taken = tm.taken;
+        temple_click_game_left = tm.game_click == 0;
+    }
 
     const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
     const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
@@ -476,7 +564,9 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         const bool left_grip_busy = HandGrab::SuppressLeftGripDpad() || HandGrab::HoldingWith(true) || Physical::HoldingPerson(true) ||
                                     left_grip_climbs || Climbing::Active() || HandActions::GripIsShoulder(true) || MeleeThrow::Available(true) ||
                                     MeleeThrow::Away(true) || gun_grip; // (fix198: sprinting with the gun in both hands)
-        if (is_left_joystick_click_down && is_left_grip_down && !left_grip_busy) {
+        // (fix205: not the right temple's click for the Data menu, the game's left stick click with Swap Controller Inputs, its grip squeezed
+        // after it began.)
+        if (is_left_joystick_click_down && is_left_grip_down && !left_grip_busy && !(temple_click_taken && temple_click_game_left)) {
             ToggleFlatScreen("the left grip held with the left stick clicked");
         }
     }
@@ -493,6 +583,17 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     } else {
         pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_START;
+        pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_BACK;
+    }
+    // (fix205) The Steam Frame's View button: the game's View (Back) by itself, as on a gamepad (first / third person; the star map's
+    // missions). (Its Menu button is the menu button above: Start.)
+    if (is_action_active_any_joystick(m_action_back_button)) {
+        pXinputGamepad->wButtons |= XINPUT_GAMEPAD_BACK;
+        pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_START;
+    }
+    // (fix205) The Data menu at your right temple (above): its tap of Start (never with Back).
+    if (temple_start_tap) {
+        pXinputGamepad->wButtons |= XINPUT_GAMEPAD_START;
         pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_BACK;
     }
 
@@ -630,8 +731,50 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_X;
     }
 
-    const auto thumbrest_touch_right_down = is_action_active_any_joystick(m_action_thumbrest_touch_right);
-    const auto thumbrest_touch_left_down = is_action_active_any_joystick(m_action_thumbrest_touch_left);
+    // (fix205) The thumbrests are LB and RB only with "Thumbrests as LB/RB" on (off by default): off, a touch counts as no touch here (no LB
+    // tap, no RB hold), and an LB or RB they were sending ends at once. The Steam Frame's bumpers are bound to the same
+    // actions (real presses, its shoulder buttons): with its controllers they stay LB and RB whatever the setting. Turned on with a thumb
+    // already resting (in Settings > VR, a menu), that touch is no fresh one: nothing until the thumb leaves and touches again (a resting right
+    // thumb would have switched the menu's tab, or readied a grenade in play). The favorites wheel still reads the touches as before.
+    // (fix205, the review) The Steam Frame's bumpers are buttons, not resting thumbs: below they are not held back with the left grip
+    // squeezed (a thumb rests on its thumbrest as the hand holds something; a bumper is pressed on purpose), nor taken for a thumb coming
+    // back as a menu closes, and they stay LB and RB in the alternative layout too.
+    // (fix207) The Valve Index controllers' trackpad presses likewise (vrcore gives each one as its hand's thumbrest action, the Index having
+    // no thumbrests): buttons, whatever the setting, as the Frame's bumpers. "frame_now" below means either.
+    const bool frame_now            = is_openxr_loaded() && (m_openxr->frame_controllers_now.load() || m_openxr->index_pads_now.load());
+    const bool thumbrests_shoulders = GameFlow::gStore.internalSettings.thumbrestsAsShoulders || frame_now;
+    const bool raw_rest_right       = is_action_active_any_joystick(m_action_thumbrest_touch_right);
+    const bool raw_rest_left        = is_action_active_any_joystick(m_action_thumbrest_touch_left);
+    {
+        static bool thumbrests_were = thumbrests_shoulders;
+        if (thumbrests_shoulders != thumbrests_were) {
+            auto& s = g_shoulders;
+            if (thumbrests_shoulders) {
+                s.lb_touch_was = raw_rest_left;
+                s.rb_touch_was = raw_rest_right;
+                s.rb_cut       = raw_rest_right;
+                if (raw_rest_right) {
+                    s.rb_touched_at = now;
+                }
+                if (raw_rest_left) {
+                    s.lb_touched_at = now;
+                }
+            } else {
+                s.lb_pending = s.lb_on = s.lb_menu = false;
+                s.rb_pending = s.rb_on = s.rb_menu = false;
+            }
+            static int thumbrest_logs = 0; // (fix207: at most 20 lines, the controllers being looked at each sync now)
+            if (thumbrest_logs < 20) {
+                ++thumbrest_logs;
+                spdlog::info("[Buttons] (fix205) the thumbrests {} (a thumb resting now: left {}, right {}){}",
+                    thumbrests_shoulders ? "are LB and RB now" : "send nothing now", raw_rest_left, raw_rest_right,
+                    frame_now ? " (fix207: the Steam Frame's bumpers or the Index trackpads' presses: buttons)" : "");
+            }
+            thumbrests_were = thumbrests_shoulders;
+        }
+    }
+    const auto thumbrest_touch_right_down = thumbrests_shoulders && raw_rest_right;
+    const auto thumbrest_touch_left_down  = thumbrests_shoulders && raw_rest_left;
 
 
     // (A grenade taken from behind the shoulder has the grenade button to itself until the game has thrown it.)
@@ -661,10 +804,13 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const bool menu_closing    = menu_now && !GameFlow::isFullscreenMenuDrawnWithin(100) && !GameFlow::isDialogueDrawnNow();
     const bool touch_guard     = just_after_menu || menu_closing;
     if (GameFlow::gStore.internalSettings.alternativeJoyLayout) {
-        // (The alternative layout: the left grip with a trigger is LB or RB, as before; the thumbrests are not shoulder buttons.)
-        sh.lb_touch_was = sh.rb_touch_was = false;
-        sh.lb_pending = sh.lb_on = sh.lb_menu = sh.rb_pending = sh.rb_on = sh.rb_cut = sh.rb_menu = false;
-        sh.lb_after_menu = false; // (fix194)
+        // (The alternative layout: the left grip with a trigger is LB or RB, as before; the thumbrests are not shoulder buttons. fix205: the
+        // Steam Frame's bumpers still are, below.)
+        if (!frame_now) {
+            sh.lb_touch_was = sh.rb_touch_was = false;
+            sh.lb_pending = sh.lb_on = sh.lb_menu = sh.rb_pending = sh.rb_on = sh.rb_cut = sh.rb_menu = false;
+            sh.lb_after_menu = false; // (fix194)
+        }
         // (fix198: not the gun's grip, held in both hands: the right trigger fires then.)
         if (is_left_grip_down && !gun_grip && is_right_trigger_down && !right_trigger_held_back) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
@@ -673,7 +819,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (is_left_grip_down && !gun_grip && is_left_trigger_down && !fav_held[0] && !TempleGestures::HoldsTrigger(true)) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
         }
-    } else {
+    }
+    if (!GameFlow::gStore.internalSettings.alternativeJoyLayout || frame_now) { // (fix205: the Frame's bumpers in either layout)
         // (fix173) The thumbrests' LB and RB, never both at once outside menus (Shoulders, above; in a menu they are its tabs, no power: each
         // as it comes, the review). The other button "out" means: not sent by the other thumbrest now, not in the last reports handed over
         // for kShoulderGap, no grip's tap of it running.
@@ -697,7 +844,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             }
             // (fix194) A touch begun just after a menu closed (above) gives no LB, nor does any touch until the thumb has been off its rest
             // kThumbLeft (a sensor dropout of a poll or two is not a new touch).
-            if (fresh && touch_guard) {
+            if (fresh && touch_guard && !frame_now) { // (fix205: not the Frame's bumper, a press)
                 if (!sh.lb_after_menu && sh.after_menu_logs < 20) {
                     ++sh.after_menu_logs;
                     spdlog::info("[Buttons] (fix194) the left thumb came back to its rest {}: no LB (the scanner) until it leaves the rest and "
@@ -711,7 +858,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             // (fix175, the review: not in build mode: LB is its category there, the grips give it; a thumb resting there changed categories.)
             // (fix198) The gun's grip, held in both hands, counts as the grip here too: the thumb rests on the thumbrest as the hand holds the
             // gun, as it did holding the left weapon (fix158), and its touch would open the scanner while aiming.
-            const bool may   = !is_left_grip_down && !wheel.left_shoulder && !(GameFlow::isWorkshopShown() && !in_menu) && !chargen_tabs; // (fix203)
+            const bool may   = (frame_now || !is_left_grip_down) && !wheel.left_shoulder && !(GameFlow::isWorkshopShown() && !in_menu) && !chargen_tabs; // (fix203)
             if (fresh) {
                 sh.lb_pending    = may && !sh.lb_after_menu;
                 sh.lb_pending_at = now;
@@ -774,7 +921,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             } else {
                 // (fix194) A touch begun just after a menu closed (above): taken away as the scanner's is, no RB until the thumb has been off
                 // its rest kThumbLeft and touches again.
-                if (fresh && touch_guard) {
+                if (fresh && touch_guard && !frame_now) { // (fix205: not the Frame's bumper, a press)
                     if (!sh.rb_cut && sh.after_menu_logs < 20) {
                         ++sh.after_menu_logs;
                         spdlog::info("[Buttons] (fix194) the right thumb came back to its rest {}: no RB (a grenade readied) until it leaves the "

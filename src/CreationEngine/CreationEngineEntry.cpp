@@ -153,6 +153,30 @@ std::optional<std::string> CreationEngineEntry::on_initialize()
 void CreationEngineEntry::on_frame()
 {
     MenuPointer::Watchdog();
+    // (fix205) A Pimax headset: its notice across the top of the game's window for the first 30 s after the headset was found (drawn by the
+    // mod's own interface after the headset's copy of the picture, so it shows on the monitor even while the headset is black). One small
+    // window a frame for those 30 s, nothing after.
+    {
+        static auto vr = VR::get();
+        const auto  xr = vr->m_openxr; // (a copy: it may be made anew on another thread)
+        if (xr != nullptr && xr->pimax.load()) {
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now_ms - xr->pimax_since_ms.load() < 30'000) {
+                const auto& io = ImGui::GetIO();
+                ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+                ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, 0.0f)); // (its height fitted to the text)
+                ImGui::SetNextWindowBgAlpha(0.85f);
+                ImGui::Begin("##sfvr_pimax_notice", nullptr,
+                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings |
+                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus);
+                ImGui::SetWindowFontScale(1.4f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.25f, 1.0f));
+                ImGui::TextWrapped("%s", runtimes::OpenXR::kPimaxNotice);
+                ImGui::PopStyleColor();
+                ImGui::End();
+            }
+        }
+    }
     GameFlow::diagnosticsTick(); // (fix201)
     // (fix198, the review) This thread kept (the VR tab's changes are applied on it), and what that tab's handlers left for it run, in order.
     m_frame_thread = GetCurrentThreadId();
@@ -271,6 +295,12 @@ void CreationEngineEntry::apply_body_settings()
     s.seatViewAtEyes = m_seat_view_at_eyes->value(); // (fix199)
     ModConstants::aimWithGunHand = m_aim_with_gun_hand->value();
     ModConstants::shootFromMuzzle = m_shoot_from_muzzle->value();
+}
+
+void CreationEngineEntry::apply_thumbrests(const char* where)
+{
+    GameFlow::gStore.internalSettings.thumbrestsAsShoulders = m_thumbrests_as_shoulders->value();
+    spdlog::info("[Buttons] (fix205) thumbrests as LB/RB {} ({})", m_thumbrests_as_shoulders->value() ? "on" : "off: they send nothing", where);
 }
 
 void CreationEngineEntry::apply_comfort_settings()
@@ -591,6 +621,17 @@ void CreationEngineEntry::set_vr_tab_rows()
     {
         Row r{};
         r.kind        = Kind::Checkbox;
+        r.text        = "Thumbrests as LB/RB";
+        r.description = "On: touching the left thumbrest taps LB (the hand scanner), resting on the right one holds RB (a grenade), in menus "
+                        "their tabs. Off: they send nothing (the scanner: the trigger at your right temple; a grenade: from behind your right "
+                        "shoulder).";
+        r.toggle      = m_thumbrests_as_shoulders.get();
+        r.apply       = later([this] { apply_thumbrests("the game's Settings > VR"); });
+        rows.push_back(std::move(r));
+    }
+    {
+        Row r{};
+        r.kind        = Kind::Checkbox;
         r.text        = "Controller vibration";
         r.description = "The controllers vibrate when you fire, get hit or reload (the game's own rumble passed on: keep the game's Controller "
                         "Vibrations on).";
@@ -700,6 +741,12 @@ void CreationEngineEntry::on_draw_main_ui(int part)
             ImGui::TextWrapped("%s", GameCode::Status().c_str());
             ImGui::PopStyleColor();
         }
+        // (fix205) A Pimax headset: its notice (also on the monitor for the first 30 s, on_frame).
+        if (const auto xr = VR::get()->m_openxr; !VRConfig::s_main_rows_here.load() && xr != nullptr && xr->pimax.load()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.25f, 1.0f));
+            ImGui::TextWrapped("%s", runtimes::OpenXR::kPimaxNotice);
+            ImGui::PopStyleColor();
+        }
         if (in_game_tab) {
             hint("The main VR settings are in the game's Settings > VR tab (Pause > Settings > VR, or Settings on the main menu): the eye "
                  "mode, sharpness, recentring, the body, turning, left-handed, the face buttons, vibration and the HUD's size. Everything else is "
@@ -748,6 +795,11 @@ void CreationEngineEntry::on_draw_main_ui(int part)
         }
         hint("On: A, B, X and Y each send the game's button of the same letter, so the game's prompts match (B is back, X drop). Off: the old "
              "layout (left X = B, left Y = X, right B = Y).");
+        if (m_thumbrests_as_shoulders->draw("Thumbrests as LB/RB")) {
+            apply_thumbrests("F11's main tab");
+        }
+        hint("On: the left thumbrest's touch taps LB (the hand scanner), a thumb resting on the right one holds RB (a grenade), in menus their "
+             "tabs. Off (the default): they send nothing.");
         bool changed = m_haptics->draw("Controller vibration");
         if (m_haptics->value()) {
             changed |= m_haptic_strength->draw("Vibration strength");
@@ -1079,6 +1131,11 @@ void CreationEngineEntry::on_draw_advanced_ui(int part)
                 GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
             }
             hint("For controllers without thumbrest sensors: LB and RB from the left grip + a trigger instead of the thumbrests (the favorites wheel and the scanner grips off).");
+            if (m_thumbrests_as_shoulders->draw("Thumbrests as LB/RB")) {
+                apply_thumbrests("F11 > Advanced");
+            }
+            hint("On: the left thumbrest's touch taps LB (the hand scanner), a thumb resting on the right one holds RB (a grenade), "
+                 "in menus their tabs (never both at once). Off (the default): they send nothing; the Steam Frame's bumpers stay LB and RB either way.");
             bool changed = false;
             if (m_haptics->value()) {
                 changed |= m_haptic_game_rumble->draw("Pass on the game's own rumble");
@@ -1418,6 +1475,7 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
     GameFlow::gStore.hudSettings.perspective = (int) m_hud_perspective->value();
     GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
     GameFlow::gStore.internalSettings.faceButtonsAsPrinted = m_face_buttons_as_printed->value(); // (fix194)
+    GameFlow::gStore.internalSettings.thumbrestsAsShoulders = m_thumbrests_as_shoulders->value(); // (fix205)
     GameFlow::gStore.internalSettings.decoupledPitch = m_decoupled_pitch->value();
     // These were only applied when a control was changed in the menu, so after a restart the
     // checkboxes showed the saved value while the mod used the default.
@@ -1450,12 +1508,13 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
         m_first_person_eye_lens->value());
     spdlog::info("[Settings] mod: dominant eye {}, aiming mode {}, decoupled pitch {}, pawn control {}, prevent zoom {}, weapon stereo depth {:.2f}, "
                  "HUD on optical centre {}, gun follows controller {} (tilt {:.1f}, turn {:.1f}, forward {:.3f}, up {:.3f}, reference {}), "
-                 "face buttons {} (fix194)",
+                 "face buttons {} (fix194), thumbrests as LB/RB {} (fix205)",
         m_dominant_eye->value() == 1 ? "Left" : "Right", m_head_tracking_type->value(), m_decoupled_pitch->value(),
         m_pawn_control_rotation->value(), m_disable_zoom->value(), m_weapon_stereo_depth->value(), m_hud_on_optical_center->value(),
         m_gun_follows_controller->value(), m_gun_pitch_offset->value(), m_gun_yaw_offset->value(), m_gun_forward_offset->value(),
         m_gun_up_offset->value(), m_gun_head_reference->value(),
-        m_face_buttons_as_printed->value() ? "as printed (A B X Y)" : "the old layout (left X = B, left Y = X, right B = Y)");
+        m_face_buttons_as_printed->value() ? "as printed (A B X Y)" : "the old layout (left X = B, left Y = X, right B = Y)",
+        m_thumbrests_as_shoulders->value() ? "on" : "off (they send nothing)");
     spdlog::info("[Settings] (fix172) people: grab bodies {} (strength {:.2f}, kept down while held {}, a grip holds standing people {} (fix173), else knocks them down {}), shoves {}, punch knockdowns {} "
                  "({:.1f} m/s), blade blocks {}, anger {}, followers spared {}, probe {}",
         m_grab_bodies->value(), m_body_grab_strength->value(), m_keep_held_down->value(), m_hold_people->value(), m_grab_knocks_down->value(), m_shove_people->value(),

@@ -4,6 +4,8 @@
 // while aiming with the hand. Ported from SFVR (AetherianArtificer's fork of starfield2vr).
 // (fix195) A continuous beam (the cutter), which the game aims again every frame, is kept along the barrel in every frame, and what it
 // hits is tested along the beam as drawn.
+// (fix204) The beam's own node, where the game draws it and starts the test of what it hits, is checked to be the gun in your hand's
+// muzzle (the game's launch copies it from the launch data) and set to it if a beam has none; logged with the game's camera FOVs.
 namespace MuzzleFire
 {
     void Install();

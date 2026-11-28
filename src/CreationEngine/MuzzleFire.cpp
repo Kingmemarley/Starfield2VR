@@ -54,6 +54,9 @@ namespace MuzzleFire
         // - +0xE4: set, the game tests what the beam hits along the camera's line (from the camera toward the game's aim point)
         //   instead of along the beam itself. With +0xF2 set (as here) the game sets it when its aim point is within 0.85 m of the
         //   weapon's own muzzle (fContinuousBeamOverrideDistance); in plain first person always (a game setting, on by default);
+        //   (fix204: read only on the beam's test without its model loaded (0x1b0c3d7); with its model the test starts at the beam's own
+        //   node's place, kBeamMuzzleNodeOffset below; the test without the model (0x1b45c30) starts fContinuousBeamSafeZoneDistance,
+        //   0.35 m by default, behind it (+0x244, set while +0xF2 is set and +0xE4 not), so its hit distance then includes those 0.35 m);
         // - a beam keeps its own copy of the launch data at +0x290 and the distance to what it hit at +0x224;
         // - the player's aim point, where the game's aim ray from the camera hit (+0x838: x, y, z, and the index at +0x844).
         constexpr std::size_t   kLaunchStartOffset       = 0x00;
@@ -68,6 +71,26 @@ namespace MuzzleFire
         constexpr std::size_t   kPlayerAimPointOffset    = 0x838;
         // (fix195) The muzzle this close to the game's aim point (metres): pushed into the surface the aim point is on.
         constexpr float         kMuzzleAtSurface         = 0.3f;
+        // (fix204) The beam's own muzzle node (BeamProjectile +0x1A8, a pointer the beam holds a reference to). Each frame the beam's
+        // update (1.16.236 0x1b0a0c3, through 0x1b51a40 and 0x1b517d0) puts the drawn beam, and the start of the test of what it hits
+        // (what it cuts and mines), at this node's place. The game's launch (0x1b3e6e0, at 0x1b3fb3f; 1.16.244 0x1b3d1af) copies the
+        // launch data's node (+0x88) into it with a reference, so with the muzzle this hook puts there (above, since fix195) it already
+        // holds the gun in your hand's muzzle: the write below is only for a beam found without one (not expected), and the log says
+        // which. Only empty with no node in the launch data, when the game's own weapon node lookup is used. The beam's clean-up as it is
+        // destroyed (0x1b3cdc0, at 0x1b3d15a) drops the reference; BeamProjectile's own setter (0x1b0b7c0) takes one the same way. The
+        // same offset and code in 1.16.244 (0x1b08e80, 0x1b3a7d1).
+        constexpr std::size_t   kBeamMuzzleNodeOffset    = 0x1A8;
+        // (fix204) The game's camera FOVs (PlayerCamera): the world's (+0x280) and the first-person one (+0x298, plus +0x29C and +0x2A4
+        // while the byte at +0x2B0 is set). Where they differ, the beam's update (at 0x1b0a10a) runs a first-person beam's start through
+        // 0x1e96420: projected with a reference camera ('1st Person Camera - World Reference', made by 0x1e87d50 from the world camera's
+        // place and the first-person FOV) and put back along the world camera's ray through the same screen point, at the same distance
+        // from it. The mod gives that camera the eye's lens (it takes it for the gun and arms camera by its name), so the two match and the
+        // start comes back where it was. For the log only (the same offsets in 1.16.244).
+        constexpr std::size_t   kCameraWorldFovOffset       = 0x280;
+        constexpr std::size_t   kCameraFirstPersonFovOffset = 0x298;
+        constexpr std::size_t   kCameraFovAddOffsetA        = 0x29C;
+        constexpr std::size_t   kCameraFovAddOffsetB        = 0x2A4;
+        constexpr std::size_t   kCameraFovAddFlagOffset     = 0x2B0;
 
         // (fix195) Where the game's beam update (BeamProjectile's update, 1.16.236 0x1b09aa0) aims its beam again each frame: it hands
         // its own copy of the launch data (+0x290) to the launch function this hook is on, only for a beam with Continuous Update. Tells
@@ -111,6 +134,110 @@ namespace MuzzleFire
             std::uint32_t flags = 0;
             std::uint8_t  kind  = 0;
             return ReadForm(launch_data, flags, kind) && kind == kBeamKind && (flags & kContinuousUpdateFlag) != 0;
+        }
+
+        // (fix204) What a beam's own muzzle node (kBeamMuzzleNodeOffset) was found holding, on the frames it was looked at.
+        enum class BeamNode
+        {
+            NotLooked,   // not looked at this frame (not the beam's update, or its muzzle not the gun in your hand)
+            Put,         // empty: the gun in your hand put there
+            AlreadyOurs, // the gun in your hand already (put on an earlier frame)
+            Other,       // another node (left as it was)
+            Unreadable,  // could not be read or written (left as it was)
+        };
+
+        // (fix204) A pointer of the game's, put there under a guard only if it is empty: `seen` gets what it held (what the swap found).
+        // False when it held something else or could not be read or written (a bad address fails instead of crashing the game).
+        bool PutPointerIfEmpty(uintptr_t at, void* value, void*& seen, bool& readable)
+        {
+            seen     = nullptr;
+            readable = false;
+            if (at < 0x10000) {
+                return false;
+            }
+            __try {
+                seen     = *reinterpret_cast<void* volatile*>(at);
+                readable = true;
+                if (seen != nullptr) {
+                    return false;
+                }
+                seen = InterlockedCompareExchangePointer(reinterpret_cast<PVOID volatile*>(at), value, nullptr);
+                return seen == nullptr;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                readable = false;
+                return false;
+            }
+        }
+
+        // (fix204) The beam's update, with its muzzle (the launch data's node) the gun in your hand: the beam's own node checked to be that
+        // muzzle too (the game's launch copies it there), and set to it if the beam has none, so the game draws the beam and tests what it
+        // hits from the gun in your hand from its next frame on. The reference the beam holds is counted here (as for the launch data's node)
+        // and dropped by the game as the beam is destroyed. A node already there (ours, as expected, or another) is left. (`beam` is the BeamProjectile: the launch data is its copy,
+        // at +0x290, handed over by its own update; `muzzle` is held by that launch data as well, so taking our count back on a failed swap
+        // never frees it.)
+        BeamNode GiveBeamTheMuzzle(std::uint8_t* beam, RE::NiAVObject* muzzle)
+        {
+            if (beam == nullptr || muzzle == nullptr) {
+                return BeamNode::Unreadable;
+            }
+            const uintptr_t at  = reinterpret_cast<uintptr_t>(beam) + kBeamMuzzleNodeOffset;
+            void*           now = nullptr;
+            if (!ReadBytes(at, &now, sizeof(now))) {
+                return BeamNode::Unreadable;
+            }
+            if (now != nullptr) { // (the usual frame once it is put: nothing counted or written)
+                return now == muzzle ? BeamNode::AlreadyOurs : BeamNode::Other;
+            }
+            auto* const count = reinterpret_cast<volatile long*>(reinterpret_cast<std::uint8_t*>(muzzle) + 8);
+            InterlockedIncrement(count); // (counted before the beam can be seen holding it)
+            void* seen     = nullptr;
+            bool  readable = false;
+            if (PutPointerIfEmpty(at, muzzle, seen, readable)) {
+                return BeamNode::Put;
+            }
+            InterlockedDecrement(count);
+            if (!readable) {
+                return BeamNode::Unreadable;
+            }
+            return seen == muzzle ? BeamNode::AlreadyOurs : BeamNode::Other;
+        }
+
+        const char* BeamNodeText(BeamNode state)
+        {
+            switch (state) {
+                case BeamNode::Put:         return "empty (not expected): the gun in your hand's muzzle put there (the beam drawn, and what it hits tested, from it from the next frame on)";
+                case BeamNode::AlreadyOurs: return "already the gun in your hand's muzzle (as expected: the game's launch copies it from the launch data)";
+                case BeamNode::Other:       return "another node (left as it was: the beam not drawn from the gun in your hand)";
+                case BeamNode::Unreadable:  return "not readable (left as it was)";
+                default:                    return "not looked at";
+            }
+        }
+
+        // (fix204) Once (on the first beam frame fired from the gun in your hand): whether the game's own first-person FOV correction of a
+        // beam's start (0x1e96420) runs. It runs unless the two FOVs are exactly equal (the game's own test); running, it changes the start
+        // only where its reference camera's lens differs from the world camera's (see kCameraWorldFovOffset).
+        void LogCameraFovsOnce()
+        {
+            static std::atomic<bool> logged{ false };
+            if (logged.exchange(true)) {
+                return;
+            }
+            const auto  camera = reinterpret_cast<uintptr_t>(CreationEngineSingletonManager::GetPlayerCameraSingleton());
+            float       world = 0.0f, first = 0.0f, add_a = 0.0f, add_b = 0.0f;
+            std::uint8_t flag = 0;
+            if (camera == 0 || !ReadBytes(camera + kCameraWorldFovOffset, &world, sizeof(world)) ||
+                !ReadBytes(camera + kCameraFirstPersonFovOffset, &first, sizeof(first)) ||
+                !ReadBytes(camera + kCameraFovAddOffsetA, &add_a, sizeof(add_a)) || !ReadBytes(camera + kCameraFovAddOffsetB, &add_b, sizeof(add_b)) ||
+                !ReadBytes(camera + kCameraFovAddFlagOffset, &flag, sizeof(flag))) {
+                spdlog::info("[MuzzleFire] (fix204) the game's camera FOVs could not be read (whether the game moves a beam's start for them not known)");
+                return;
+            }
+            const float used = flag != 0 ? first + (add_a + add_b) : first;
+            spdlog::info("[MuzzleFire] (fix204) the game's camera FOVs: the world's {:.2f}, the first person's {:.2f}{}: the game's FOV correction of "
+                         "a beam's start {}",
+                world, used, flag != 0 ? std::format(" ({:.2f} + {:.2f} + {:.2f})", first, add_a, add_b) : std::string{},
+                used == world ? "is off (equal)"
+                              : "runs (they differ; it moves the start only where its reference camera's lens differs from the world camera's)");
         }
 
         // (fix195) A place as the game keeps it (the launch's start, the player's aim point): x, y, z in a frame of reference given by the
@@ -199,6 +326,10 @@ namespace MuzzleFire
             float                                 off_last{ -1.0f };
             float                                 along_last{ 0.0f }; // ...and how far out along it (with off_last)
             float                                 hit_last{ -1.0f };  // the beam's hit distance, as the game last had it
+            BeamNode                              node_first{ BeamNode::NotLooked }; // (fix204) the beam's own node, as first looked at
+            int                                   node_put{ 0 };      // (fix204) ...frames the gun's muzzle was put there
+            int                                   node_ours{ 0 };     // ...frames it was already there
+            int                                   node_other{ 0 };    // ...frames another node was there, or it could not be read
         };
         std::mutex        g_beam_log_mutex;
         BeamPull          g_pull;
@@ -218,20 +349,27 @@ namespace MuzzleFire
             spdlog::info("[MuzzleFire] (fix195) continuous beam, pull #{}: {} frames, {} fired along the barrel; the game's own direction (its "
                          "muzzle node) {:.1f} deg from the barrel on average, at most {:.1f}; the game asked for the camera's line on {} frames "
                          "({} of them kept: the muzzle at the surface; else cleared where fired along the barrel); the game's aim point {} from "
-                         "the barrel's line at most ({} last, {} out); the beam's last hit distance {}; shots follow the barrel: {}{}",
+                         "the barrel's line at most ({} last, {} out); the beam's last hit distance {}; shots follow the barrel: {}; (fix204) the "
+                         "beam's own node: first {}, then the gun's muzzle put there on {} frames, already there on {}, another or unreadable on "
+                         "{}{}",
                 p.number, p.frames, p.written, p.turn_n > 0 ? p.turn_sum / p.turn_n : 0.0f, p.turn_max, p.camera_line, p.camera_kept,
                 p.off_max >= 0.0f ? std::format("{:.3f} m", p.off_max) : std::string{ "unknown" },
                 p.off_last >= 0.0f ? std::format("{:.3f} m", p.off_last) : std::string{ "unknown" },
                 p.off_last >= 0.0f ? std::format("{:.2f} m", p.along_last) : std::string{ "unknown" },
                 p.hit_last >= 0.0f ? std::format("{:.2f} m", p.hit_last) : std::string{ "not known" }, p.follow ? "yes" : "no",
-                p.number == kSummaryPulls ? " (the last pull logged)" : "");
+                p.node_first == BeamNode::Put           ? "empty"
+                : p.node_first == BeamNode::AlreadyOurs ? "the gun's muzzle"
+                : p.node_first == BeamNode::Other       ? "another node"
+                : p.node_first == BeamNode::Unreadable  ? "unreadable"
+                                                        : "never looked at",
+                p.node_put, p.node_ours, p.node_other, p.number == kSummaryPulls ? " (the last pull logged)" : "");
         }
 
         // (fix195) One frame of the continuous beam, for the log: the angles the game worked out (before this hook wrote any) against the
         // barrel, whether the game asked for the camera's line, the beam's hit distance (its later frames only), and where the game's
         // aim point lies against the launch's start (the muzzle) and the barrel's line.
         void NoteBeamFrame(const std::uint8_t* launch_data, const float* game_angles, CameraLine camera_line, bool written, bool later,
-            const char* left, uintptr_t from)
+            const char* left, uintptr_t from, BeamNode node_state)
         {
             // (Once the last pull logged is summed up: nothing more read for it, no lock taken.)
             if (g_beam_log_done.load(std::memory_order_relaxed)) {
@@ -310,6 +448,18 @@ namespace MuzzleFire
             if (hit >= 0.0f) {
                 g_pull.hit_last = hit;
             }
+            // (fix204) The beam's own node: counted, and the first time it is looked at in a pull, said in a line of its own.
+            if (node_state != BeamNode::NotLooked) {
+                g_pull.node_put += node_state == BeamNode::Put ? 1 : 0;
+                g_pull.node_ours += node_state == BeamNode::AlreadyOurs ? 1 : 0;
+                g_pull.node_other += node_state == BeamNode::Other || node_state == BeamNode::Unreadable ? 1 : 0;
+                if (g_pull.node_first == BeamNode::NotLooked) {
+                    g_pull.node_first = node_state;
+                    spdlog::info("[MuzzleFire] (fix204) continuous beam, pull #{} frame {}: the beam's own node (where the game draws it and tests "
+                                 "what it hits from) was {}",
+                        g_pull.number, g_pull.frames, BeamNodeText(node_state));
+                }
+            }
             if (g_pull.frames <= kDetailedFrames && g_pull.number <= kDetailedPulls) {
                 spdlog::info("[MuzzleFire] (fix195) continuous beam, pull #{} frame {} ({}{}; its form: {}): {}; the game's own direction {} from "
                              "the barrel (pitch {:.1f}, yaw {:.1f} deg); camera's line asked {}; the beam's hit distance {}; the game's aim point {}; "
@@ -379,6 +529,7 @@ namespace MuzzleFire
             bool        later = false;    // (fix195) a continuous beam's later frame (its muzzle given before)
             bool        ours  = false;    // (fix195) ...and that muzzle is the gun in your hand, found this frame
             const char* left  = "";       // (fix195) why a frame is left to the game (the log)
+            BeamNode    beam_node = BeamNode::NotLooked; // (fix204) the beam's own node, when looked at this frame
             if (aiming && ModConstants::shootFromMuzzle) {
                 {
                     launch_data[kAimFromMuzzleOffset] = 1;
@@ -398,8 +549,19 @@ namespace MuzzleFire
                         const auto muzzle_now = body::GetBodyMuzzle();
                         ours                  = muzzle_now != nullptr && node == muzzle_now;
                         left                  = muzzle_now == nullptr ? "the gun in your hand not found this frame" : "not fired from the gun in your hand";
+                        // (fix204) In the beam's own update (its launch data the beam's copy, at +0x290), fired from the gun in your hand:
+                        // the beam's own node (where the game draws it and starts the test of what it hits) checked to be that gun's muzzle,
+                        // and set to it if the beam has none (the game's launch normally copies it there already). (Not with the body off,
+                        // or another muzzle: `ours` is false then; never for other projectiles: only the beam's update makes this call.)
+                        if (ours && beam_update) {
+                            beam_node = GiveBeamTheMuzzle(launch_data - kBeamLaunchDataOffset, muzzle_now);
+                            LogCameraFovsOnce();
+                        }
                     }
                     body::NotifyPlayerFired();
+                    if (beam) {
+                        body::NotifyBeamFrame(); // (fix206: a multi-beam weapon's firing hold is learned only on a continuous beam's frames)
+                    }
                 }
             }
             const bool result = g_compute_launch_origin_hook.call<bool>(launch_data);
@@ -448,7 +610,7 @@ namespace MuzzleFire
             }
             if (beam) {
                 NoteBeamFrame(launch_data, game_angles, camera_line, barrel, later,
-                    barrel ? "" : (later ? ours : aim) ? "the barrel not known this frame" : left, from);
+                    barrel ? "" : (later ? ours : aim) ? "the barrel not known this frame" : left, from, beam_node);
             }
             // Last, so a grenade thrown from the shoulder goes along the hand's throw.
             if (grenade_pending) {
@@ -500,7 +662,8 @@ namespace MuzzleFire
         }
         spdlog::info("[MuzzleFire] (fix195) a continuous beam (the cutter) is fired along the barrel in every frame, what it hits tested along "
                      "it; the beam update's call {}",
-            g_beam_return != 0 ? "found (its hit distance logged)" : "not known in this build (its hit distance not logged)");
+            g_beam_return != 0 ? "found (its hit distance logged; (fix204) the beam's own node checked to be the gun in your hand's muzzle)"
+                               : "not known in this build (its hit distance not logged; (fix204) the beam's own node not checked)");
         g_compute_launch_origin_hook = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&ComputeLaunchOrigin));
         if (!g_compute_launch_origin_hook) {
             spdlog::error("[MuzzleFire] Failed to hook ComputeLaunchOrigin");

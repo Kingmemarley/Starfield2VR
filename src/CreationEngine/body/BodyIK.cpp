@@ -2957,9 +2957,43 @@ namespace body
             // (fix195) The barrel from the model's own transforms is in use this frame but not kept yet (the estimate starts over if it
             // stops before it is kept).
             bool provisional{ false };
+            // (fix206) A multi-beam weapon (the cutter: ProjectileNodeChild nodes under its ProjectileNode, its three lenses): its
+            // ProjectileNode is not its barrel (in first person the game swings that node up to about 40 degrees while it fires, Homard's
+            // Starfield VR; ours sits under a dummy receiver), so the beam and the laser, which go along that node's axis, left the cutter's
+            // lenses at a slant. It is held instead the way the game holds it while firing (Homard's "natural grip"), learned once on a
+            // pull, eased in, and kept: the beam and the laser then go where the cutter points. Its ProjectileNode's axis is the start.
+            bool      multi_beam{ false };
+            bool      multi_beam_checked{ false }; // (its muzzle looked at once)
+            bool      axis_kept{ false };          // its ProjectileNode's axis (with the game's up square to it) kept as the start
+            glm::vec3 axis_forward{ 0.0f, 1.0f, 0.0f };
+            glm::vec3 axis_up{ 0.0f, 0.0f, 1.0f };
+            bool      hold_learned{ false };       // its firing hold learned on a pull (or kept from an earlier draw of this weapon)
+            glm::vec3 hold_forward{ 0.0f, 1.0f, 0.0f };
+            glm::vec3 hold_up{ 0.0f, 0.0f, 1.0f };
+            std::chrono::steady_clock::time_point pull_start{}, last_fire{}, last_ease{};
+            bool      window_done{ false };        // this pull's learning window over
+            glm::vec3 sum_forward{ 0.0f }, sum_up{ 0.0f };
+            int       samples{ 0 }, refused{ 0 };
         };
         WeaponBasis       g_basis;
         std::atomic<bool> g_fire_sample{ false };
+        // (fix206) A continuous beam's frame fired from the gun in your hand (MuzzleFire, NotifyBeamFrame): the only frames a multi-beam
+        // weapon's firing hold is learned on (an automatic gun's recoiling fire hold is never taken, the review).
+        std::atomic<bool> g_beam_sample{ false };
+
+        // (fix206) A multi-beam weapon's firing hold, kept by its form for this game session (a redraw or a load makes a new model and starts
+        // the basis over: the hold learned for the same weapon is used again at once). In the weapon's own space.
+        struct LearnedHold
+        {
+            glm::vec3 forward{ 0.0f, 1.0f, 0.0f };
+            glm::vec3 up{ 0.0f, 0.0f, 1.0f };
+        };
+        std::unordered_map<std::uint32_t, LearnedHold> g_learned_holds; // (the body's update only, as g_basis)
+        constexpr float kMultiBeamHoldLimitDeg = 25.0f;                // a firing hold further than this from the node's axis: not taken
+        constexpr auto  kHoldWindowStart       = std::chrono::milliseconds(150);
+        constexpr auto  kHoldWindowEnd         = std::chrono::milliseconds(400);
+        constexpr int   kHoldMinSamples        = 5;
+        constexpr float kHoldEaseSeconds       = 0.25f; // (the gun turns toward the learned hold with this time constant: ~95% in 0.75 s)
 
         // The first-person hand's anatomical frame (fingers forward, thumb up, palm centre) in its wrist's space, so a
         // grip held by that hand can be transferred onto the body's hand whatever the two skeletons' bone axes.
@@ -3041,6 +3075,150 @@ namespace body
             return out;
         }
 
+        // (fix206) The angle between two directions, in degrees.
+        float AngleDeg(const glm::vec3& a, const glm::vec3& b)
+        {
+            const float la = glm::length(a), lb = glm::length(b);
+            if (!(la > 1e-6f) || !(lb > 1e-6f)) {
+                return 180.0f;
+            }
+            return glm::degrees(std::acos(std::clamp(glm::dot(a, b) / (la * lb), -1.0f, 1.0f)));
+        }
+
+        // (fix206) A multi-beam weapon's muzzle: ProjectileNodeChild nodes under it (the cutter's three lenses; Homard's test).
+        bool HasMultiBeamChild(const RE::NiAVObject* muzzle)
+        {
+            RE::NiAVObject* children[8]{};
+            const auto      n = ReadChildren(muzzle, children, 8);
+            for (std::uint16_t i = 0; i < n; ++i) {
+                const char* name = children[i] ? children[i]->name.c_str() : nullptr;
+                if (name != nullptr && Contains(name, "ProjectileNodeChild")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // (fix206) Once each draw (20 in all): the multi-beam weapon's lenses (its ProjectileNodeChild nodes) in the weapon's own space,
+        // where each sits and which way it points, against its ProjectileNode's axis: what the beams leave along.
+        void LogMultiBeamNodes(const RE::NiAVObject* muzzle, const RE::NiAVObject* weapon)
+        {
+            static int told = 0;
+            if (muzzle == nullptr || weapon == nullptr || told >= 20) {
+                return;
+            }
+            ++told;
+            const Xf    to_weapon = Inverse(FromNi(weapon->world));
+            const Xf    m         = Compose(to_weapon, FromNi(muzzle->world));
+            std::string text      = std::format("its ProjectileNode at ({:.3f},{:.3f},{:.3f}) pointing ({:.3f},{:.3f},{:.3f})", m.t.x, m.t.y, m.t.z,
+                     m.r[1].x, m.r[1].y, m.r[1].z);
+            RE::NiAVObject* children[8]{};
+            const auto      n = ReadChildren(muzzle, children, 8);
+            for (std::uint16_t i = 0; i < n; ++i) {
+                const char* name = children[i] ? children[i]->name.c_str() : nullptr;
+                if (name == nullptr || !Contains(name, "ProjectileNodeChild")) {
+                    continue;
+                }
+                const Xf c = Compose(to_weapon, FromNi(children[i]->world));
+                text += std::format("; {} at ({:.3f},{:.3f},{:.3f}) pointing ({:.3f},{:.3f},{:.3f}), {:.1f} deg from the node's axis", name, c.t.x, c.t.y,
+                    c.t.z, c.r[1].x, c.r[1].y, c.r[1].z, AngleDeg(c.r[1], m.r[1]));
+            }
+            spdlog::info("[BodyIK] (fix206) the multi-beam weapon {:08X} in its own space (weapon units): {}", HandGrab::WeaponInHandsId(), text);
+        }
+
+        // (fix206) A multi-beam weapon (the cutter), after its ProjectileNode's axis is kept: its firing hold (`hold_forward`/`hold_up`, the
+        // game's first-person hold of it this frame: the camera's forward and up in that weapon's space) learned once, from 0.15 to 0.40 s
+        // into a pull of a continuous beam (its frames only, NotifyBeamFrame: a weapon that fires no beam keeps its node's axis, as other
+        // guns do) (the averaged frames within 25 degrees of the node's axis; at least 5 of them, else the next pull tries again),
+        // then kept for this weapon (and its form, for later draws). The basis used eases from the node's axis toward it (0.25 s time
+        // constant, no snap), and stays there. Nothing of the hand's motion is in it: the first-person model is the game's own, not ours.
+        void UpdateMultiBeamHold(const glm::vec3& hold_forward_now, const glm::vec3& hold_up_now, std::chrono::steady_clock::time_point now)
+        {
+            using clock = std::chrono::steady_clock;
+            g_fire_sample.store(false); // (any shot: not used here; only a continuous beam's frames below)
+            if (g_beam_sample.exchange(false)) {
+                if (g_basis.last_fire == clock::time_point{} || now - g_basis.last_fire > std::chrono::milliseconds(300)) {
+                    g_basis.pull_start  = now; // (a new pull)
+                    g_basis.window_done = false;
+                    g_basis.sum_forward = glm::vec3{ 0.0f };
+                    g_basis.sum_up      = glm::vec3{ 0.0f };
+                    g_basis.samples     = 0;
+                    g_basis.refused     = 0;
+                }
+                g_basis.last_fire = now;
+            }
+            const bool firing = g_basis.last_fire != clock::time_point{} && now - g_basis.last_fire < std::chrono::milliseconds(100);
+            if (!g_basis.hold_learned && firing && !g_basis.window_done) {
+                const auto into = now - g_basis.pull_start;
+                if (into >= kHoldWindowStart && into <= kHoldWindowEnd) {
+                    if (std::isfinite(hold_forward_now.x) && std::isfinite(hold_up_now.x) &&
+                        AngleDeg(hold_forward_now, g_basis.axis_forward) <= kMultiBeamHoldLimitDeg) {
+                        g_basis.sum_forward += hold_forward_now;
+                        g_basis.sum_up += hold_up_now;
+                        ++g_basis.samples;
+                    } else {
+                        ++g_basis.refused;
+                    }
+                } else if (into > kHoldWindowEnd) {
+                    g_basis.window_done = true;
+                    static int told     = 0;
+                    bool       learned  = false;
+                    if (g_basis.samples >= kHoldMinSamples && glm::length(g_basis.sum_forward) > 1e-3f) {
+                        const glm::vec3 f  = glm::normalize(g_basis.sum_forward);
+                        glm::vec3       u  = g_basis.sum_up - f * glm::dot(g_basis.sum_up, f);
+                        if (glm::length(u) > 0.1f && AngleDeg(f, g_basis.axis_forward) <= kMultiBeamHoldLimitDeg) {
+                            u                    = glm::normalize(u);
+                            g_basis.hold_learned = true;
+                            g_basis.hold_forward = f;
+                            g_basis.hold_up      = u;
+                            learned              = true;
+                            if (const auto form = HandGrab::WeaponInHandsId(); form != 0) {
+                                g_learned_holds[form] = LearnedHold{ f, u };
+                            }
+                            if (told < 20) {
+                                ++told;
+                                // (Its way against the node's axis: up and right in the axis' own frame.)
+                                const glm::vec3 right = glm::normalize(glm::cross(g_basis.axis_forward, g_basis.axis_up));
+                                const float     upd   = glm::degrees(std::asin(std::clamp(glm::dot(f, g_basis.axis_up), -1.0f, 1.0f)));
+                                const float     rightd = glm::degrees(std::atan2(glm::dot(f, right), glm::dot(f, g_basis.axis_forward)));
+                                spdlog::info("[BodyIK] (fix206) the multi-beam weapon {:08X}'s firing hold learned on a pull ({} frames, {} over 25 deg "
+                                             "left out): ({:.3f},{:.3f},{:.3f}) in its space, {:.1f} deg from its ProjectileNode's axis ({:+.1f} up, "
+                                             "{:+.1f} right): the gun eased into it and held so from now on (the beam and the laser go along it)",
+                                    HandGrab::WeaponInHandsId(), g_basis.samples, g_basis.refused, f.x, f.y, f.z, AngleDeg(f, g_basis.axis_forward), upd,
+                                    rightd);
+                            }
+                        }
+                    }
+                    if (!learned && told < 20) {
+                        ++told;
+                        spdlog::info("[BodyIK] (fix206) the multi-beam weapon {:08X}'s firing hold not learned on this pull ({} frames within 25 deg "
+                                     "of its ProjectileNode's axis, {} further; {} needed): held by that axis, tried again on the next pull",
+                            HandGrab::WeaponInHandsId(), g_basis.samples, g_basis.refused, kHoldMinSamples);
+                    }
+                }
+            }
+            // The basis in use eased toward the learned hold (else the node's axis), its up kept square to its forward.
+            const glm::vec3 want_forward = g_basis.hold_learned ? g_basis.hold_forward : g_basis.axis_forward;
+            const glm::vec3 want_up      = g_basis.hold_learned ? g_basis.hold_up : g_basis.axis_up;
+            float           dt           = 0.0f; // (the review: no first-frame jump; last_ease is also set as the axis is kept)
+            if (g_basis.last_ease != clock::time_point{}) {
+                dt = std::clamp(std::chrono::duration<float>(now - g_basis.last_ease).count(), 0.0f, 0.1f);
+            }
+            g_basis.last_ease = now;
+            const float a     = g_basis.has ? 1.0f - std::exp(-dt / kHoldEaseSeconds) : 1.0f;
+            glm::vec3   f     = glm::mix(g_basis.forward, want_forward, a);
+            f                 = glm::length(f) > 1e-4f ? glm::normalize(f) : want_forward;
+            glm::vec3 u       = glm::mix(g_basis.up, want_up, a);
+            u                 = u - f * glm::dot(u, f);
+            u                 = glm::length(u) > 0.1f ? glm::normalize(u) : want_up;
+            if (std::isfinite(f.x) && std::isfinite(f.y) && std::isfinite(f.z) && std::isfinite(u.x) && std::isfinite(u.y) && std::isfinite(u.z)) {
+                g_basis.forward = f;
+                g_basis.up      = u;
+            }
+            g_basis.has   = true;
+            g_basis.fired = true; // (BarrelKnown: the laser's beam shown, as for a gun's kept muzzle)
+        }
+
         void SampleWeaponBasis(RE::NiAVObject* first_weapon)
         {
             auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
@@ -3054,6 +3232,19 @@ namespace body
                 g_basis        = {};
                 g_basis.weapon = g_place.node;
                 g_basis.muzzle = muzzle_now;
+                g_beam_sample.store(false); // (fix206: not the last weapon's beam)
+            }
+            // (fix206) Whether it is a multi-beam weapon (the cutter), looked at once for each muzzle.
+            if (!g_basis.multi_beam_checked && muzzle_now != nullptr) {
+                g_basis.multi_beam_checked = true;
+                g_basis.multi_beam         = HasMultiBeamChild(muzzle_now);
+                static int told = 0;
+                if (g_basis.multi_beam && told < 20) {
+                    ++told;
+                    spdlog::info("[BodyIK] (fix206) a multi-beam weapon {:08X} (ProjectileNodeChild nodes under its muzzle, the cutter): held the way "
+                                 "the game holds it while firing, learned on a pull ({} for it already)",
+                        HandGrab::WeaponInHandsId(), g_learned_holds.contains(HandGrab::WeaponInHandsId()) ? "a hold learned" : "none learned");
+                }
             }
             const auto to_weapon = glm::transpose(FromNi(first_weapon->world).r);
             const auto view_r    = FromNi(world_camera->parent->world).r;
@@ -3080,6 +3271,12 @@ namespace body
                 g_basis.gun_since     = {};
             } else if (g_basis.gun_since == std::chrono::steady_clock::time_point{}) {
                 g_basis.gun_since = gun_now;
+            }
+            // (fix206) A multi-beam weapon whose ProjectileNode's axis is kept (below): from then on held by its firing hold, learned on a pull
+            // (the muzzle's axis meanwhile).
+            if (g_basis.multi_beam && g_basis.axis_kept) {
+                UpdateMultiBeamHold(forward, up, gun_now);
+                return;
             }
             // (fix195) The muzzle's way in the weapon from the model's own transforms (its local transforms up to the weapon node), as
             // Homard's Starfield VR reads it from the model: right from the gun's first frame in the hand, with no wait for the model's
@@ -3124,8 +3321,24 @@ namespace body
                                 barrel.x, barrel.y, barrel.z, g_basis.muzzle_frames,
                                 glm::degrees(std::acos(std::clamp(glm::dot(barrel, forward), -1.0f, 1.0f))));
                             g_basis.fired       = true; // (as good as a shot's: not changed by the hold any more)
-                            g_basis.from_muzzle = true;
                             g_basis.provisional = false;
+                            if (g_basis.multi_beam) {
+                                // (fix206) A multi-beam weapon: its node's axis kept as the start, its firing hold then learned on a pull
+                                // (UpdateMultiBeamHold; or the one learned for this weapon before, eased in from here).
+                                g_basis.axis_kept    = true;
+                                g_basis.axis_forward = g_basis.forward;
+                                g_basis.axis_up      = g_basis.up;
+                                g_basis.last_ease    = gun_now; // (a hold kept from an earlier draw eases in from here, no snap)
+                                if (const auto it = g_learned_holds.find(HandGrab::WeaponInHandsId()); it != g_learned_holds.end() &&
+                                    AngleDeg(it->second.forward, g_basis.axis_forward) <= kMultiBeamHoldLimitDeg) {
+                                    g_basis.hold_learned = true;
+                                    g_basis.hold_forward = it->second.forward;
+                                    g_basis.hold_up      = it->second.up;
+                                }
+                                LogMultiBeamNodes(muzzle, g_place.node);
+                            } else {
+                                g_basis.from_muzzle = true;
+                            }
                         }
                         g_fire_sample.store(false);
                         return;
@@ -4794,7 +5007,11 @@ namespace body
                                 spdlog::info("[BodyIK] (fix156) {} s after the weapon {:08X} came: the first-person rig {} (hidden {}); its weapon bone holds [{}]; the "
                                              "body's holds [{}]; the hold sampled now {:.1f} deg from the one in use (basis from {})",
                                     told == 1 ? 1 : 3, form_now, root ? "found" : "not found", root ? IsAppCulled(root) : false, kids, body_kids, sampled_deg,
-                                    g_basis.from_muzzle ? "the muzzle" : g_basis.fired ? "a shot" : "the estimate");
+                                    g_basis.from_muzzle                             ? "the muzzle"
+                                    : g_basis.multi_beam && g_basis.hold_learned    ? "the firing hold (fix206: a multi-beam weapon)"
+                                    : g_basis.multi_beam && g_basis.axis_kept       ? "the muzzle until the firing hold is learned (fix206)"
+                                    : g_basis.fired                                 ? "a shot"
+                                                                                    : "the estimate");
                             }
                         }
                         SampleWeaponBasis(first_weapon);
@@ -6482,6 +6699,11 @@ namespace body
     void NotifyPlayerFired()
     {
         g_fire_sample = true;
+    }
+
+    void NotifyBeamFrame()
+    {
+        g_beam_sample = true;
     }
 
     bool GunHeldWithBothHands()

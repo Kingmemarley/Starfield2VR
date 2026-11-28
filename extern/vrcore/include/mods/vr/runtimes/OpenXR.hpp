@@ -165,6 +165,82 @@ public:
     std::atomic<bool> input_synced{false};
     bool input_focused() const { return this->session_state.load() == XR_SESSION_STATE_FOCUSED && this->input_synced.load(); }
 
+    // (fix205) The headset report: which runtime and headset this is, which controller each hand is taken as, and which physical buttons
+    // the menu button's action (the game's Start: the Data menu) got. Some runtimes keep a controller's menu button for themselves (SteamVR
+    // opens its dashboard with it), and the game then never gets Start; the log says so instead of leaving it to guesswork. The runtime's
+    // name and version and the system's name are noted once at start (VR's OpenXR start); the report is written a moment after the first
+    // sync made while focused and after each change of the controllers (the runtime sends its profile-changed events in bursts: one report
+    // for each burst), on the thread that syncs the input. A few lines each time, at most kHeadsetReports times a session.
+    std::string runtime_name{};
+    std::string system_name{};
+    // (fix205) A Pimax headset (its runtime's or system's name says so): a notice for the first 30 s on the monitor (the game side draws it,
+    // CreationEngineEntry), in the log and in F11, since its passthrough can leave the headset black. Set once at start (VR's OpenXR start).
+    std::atomic<bool> pimax{false};
+    std::atomic<int64_t> pimax_since_ms{0}; // (steady clock)
+    static constexpr const char* kPimaxNotice =
+        "Pimax headset: if the headset shows a black screen, turn off passthrough in Pimax Play, then restart the game.";
+    std::atomic<bool> headset_report_wanted{false};
+    std::atomic<int64_t> headset_report_at_ms{0};
+    bool headset_report_started{false}; // (the first report asked for after the first sync made while focused)
+    int headset_reports{0};
+    static constexpr int kHeadsetReports = 12;
+    // (fix205) Either hand's controller is taken as the Steam Frame's now (set at each sync): its bumpers are the thumbrest actions'
+    // buttons, real presses, so the game side keeps them LB and RB whatever its thumbrest setting says.
+    std::atomic<bool> frame_controllers_now{false};
+    XrPath frame_profile_path{XR_NULL_PATH}; // (its profile's path, made at the first sync: the input's thread only)
+
+    // (fix207) Valve Index controllers (each hand's controller looked at each sync, on the input's thread; the game side reads the results):
+    // - The grip button (the "grip" action: aiming, the left grip's combos, the favorites wheel, the grips as LB/RB). The runtime makes it
+    //   from the grip's squeeze value with its own point: Pimax's runtime (built on PimaxXR) only past 0.95, with no hysteresis, so it needs
+    //   an almost full squeeze and flickers near it, while the mod's grabs (HandGrab) take 0.75 and let go below 0.40. On an Index the
+    //   button is made here from the same value with the grabs' points, except on SteamVR, whose own controller bindings set it (each
+    //   player can tune it there).
+    // - The trackpad's press (s_index_bindings): pressed past kIndexPadOn, let go below kIndexPadOff; given as that hand's thumbrest action
+    //   (left: LB, right: RB on the game side, which takes them as buttons, index_pads_now).
+    XrPath index_profile_path{XR_NULL_PATH}; // (made at the first sync: the input's thread only)
+    XrAction grip_action{XR_NULL_HANDLE};            // (the actions' handles, set as they are made)
+    XrAction trigger_action{XR_NULL_HANDLE};
+    XrAction finger_grip_action{XR_NULL_HANDLE};
+    XrAction finger_trigger_action{XR_NULL_HANDLE};
+    XrAction trackpad_force_action{XR_NULL_HANDLE};
+    XrAction thumbrest_actions[2]{XR_NULL_HANDLE, XR_NULL_HANDLE}; // (left, right)
+    std::array<std::atomic<bool>, 2> index_hand{};      // the hand's controller is taken as an Index now
+    std::array<std::atomic<bool>, 2> grip_from_value{}; // its grip button is made here from the value...
+    std::array<std::atomic<bool>, 2> grip_value_down{}; // ...and is down
+    std::array<std::atomic<bool>, 2> index_pad_live{};  // its trackpad's press is read (bound, and an Index)...
+    std::array<std::atomic<bool>, 2> index_pad_down{};  // ...and is pressed
+    std::atomic<bool> index_pads_now{false};            // either hand's trackpad press is read now
+    // (fix207, the review) get_finger_input's button-as-value fallback only for a hand whose controller has given no real value (over 0.1)
+    // since it was taken as its current profile: a runtime that gives values never has it (a value of 0 with the button down is then just
+    // that). Reset as the hand's profile changes. Vive wands and Windows Mixed Reality controllers give their grip as a click only: there the
+    // grip's click counts as a full squeeze (grabs and climbing work with it).
+    XrPath hand_profile_now[2]{XR_NULL_PATH, XR_NULL_PATH}; // (the input's thread only)
+    std::array<std::atomic<bool>, 2> trigger_value_seen{};
+    std::array<std::atomic<bool>, 2> grip_value_seen{};
+    static constexpr float kIndexGripOn  = 0.75f; // (HandGrab's kGripOn and kGripOff)
+    static constexpr float kIndexGripOff = 0.40f;
+    static constexpr float kIndexPadOn   = 0.50f;
+    static constexpr float kIndexPadOff  = 0.30f;
+    int index_hand_logs{0};
+    // (fix207) Each 10 s while a trigger or grip was used: the highest value each hand's trigger, grip (and an Index's trackpad press) gave,
+    // and how many syncs the runtime's own trigger and grip buttons were down: a runtime that gives the buttons but no values shows as a
+    // button down with its value 0 (get_finger_input then takes the button as the whole value). The input's thread only.
+    struct InputPeaks {
+        float trigger{0.0f};
+        float grip{0.0f};
+        float pad{0.0f};
+        int trigger_down{0};
+        int grip_down{0};
+    };
+    InputPeaks input_peaks[2]{};
+    int64_t input_peaks_since_ms{0};
+    int input_peak_logs{0};
+    static constexpr int kInputPeakLogs = 30;
+    // The report itself (the input's thread, after a successful xrSyncActions); `why` names what asked for it.
+    void report_headset(const char* why);
+    // Which physical buttons an action got now ("none" when it got none; "?" when the runtime could not say), and how many.
+    std::string bound_sources(XrAction action, uint32_t& count, bool localized) const; // (localized: also the runtime's own names)
+
     XrSpaceLocation view_space_location{XR_TYPE_SPACE_LOCATION};
 
     std::vector<XrViewConfigurationView> view_configs{};
@@ -391,6 +467,12 @@ public:
     // so it stays put as you look around), dimmed by a veil, or darkness. The controllers point at it (a beam and a dot);
     // where a beam meets it is given to the game side (panel_pointer) as a place on the game's picture.
     static inline bool ext_cylinder{false};
+    // (fix205) The Steam Frame's controllers (XR_VALVE_frame_controller_interaction, SteamVR): their own interaction profile, when the
+    // runtime offers it. Without it SteamVR remaps the Touch bindings onto them (the Touch menu button as the View button, B/Y as all three
+    // top buttons), and their bumpers and D-pad reach nothing.
+    static inline bool ext_frame_controller{false};
+    static constexpr const char* kFrameControllerExtension = "XR_VALVE_frame_controller_interaction";
+    static constexpr const char* kFrameControllerProfile = "/interaction_profiles/valve/frame_controller_valve";
     // Settings (VRConfig).
     std::atomic<bool> panel_enabled{true};
     std::atomic<bool> panel_curved{true};
@@ -950,6 +1032,40 @@ public:
         "/interaction_profiles/valve/index_controller",
         "/interaction_profiles/microsoft/motion_controller",
         "/interaction_profiles/htc/vive_controller",
+        // (fix205) Only suggested when the runtime offers its extension (ext_frame_controller; else skipped, not even tried).
+        "/interaction_profiles/valve/frame_controller_valve",
+    };
+
+    // (fix205) The Steam Frame's own buttons, suggested for its profile alone (after the table above, whose shared paths it also takes:
+    // poses, triggers, squeeze, thumbsticks and their clicks, right A and B, the right menu button, the haptics). All four letters are on
+    // its right controller: each goes to the action of the Touch button with the same letter (X and Y are Touch's left-hand buttons, so the
+    // game gets the letter printed whatever Swap Controller Inputs says, as fix194 has it). It has no thumbrests: its bumpers (the shoulder
+    // buttons above the triggers) stand in for them (the left one's LB tap, the right one's RB held while pressed, as a resting thumb's).
+    // Its left D-pad gives the game's D-pad; its left View button the game's View (Back: first / third person), as on a gamepad.
+    // ("bumper" is the name in Valve's documentation; "shoulder" is suggested too, for SteamVR versions that renamed it: a path a runtime
+    // does not know is left out, the rest kept.)
+    static inline std::vector<InteractionBinding> s_frame_bindings {
+        {"/user/hand/right/input/x/click", "abuttonleft"},
+        {"/user/hand/right/input/y/click", "bbuttonleft"},
+        {"/user/hand/left/input/bumper/click", "thumbresttouchleft"},
+        {"/user/hand/right/input/bumper/click", "thumbresttouchright"},
+        {"/user/hand/left/input/shoulder/click", "thumbresttouchleft"},
+        {"/user/hand/right/input/shoulder/click", "thumbresttouchright"},
+        {"/user/hand/left/input/dpad_up/click", "dpad_up"},
+        {"/user/hand/left/input/dpad_right/click", "dpad_right"},
+        {"/user/hand/left/input/dpad_down/click", "dpad_down"},
+        {"/user/hand/left/input/dpad_left/click", "dpad_left"},
+        {"/user/hand/left/input/view/click", "backbutton"},
+    };
+
+    // (fix207) The Valve Index controllers' own extra input, suggested for their profile alone: each trackpad's press (its force, 0 to 1),
+    // read as a value (the mod's own press and release points, update_input) so it works the same on every runtime (a runtime that turns
+    // a value into a button may want it pressed almost all the way: PimaxXR's 0.95). The Index has no thumbrests: the left pad's press is
+    // the left thumbrest's LB, the right pad's the right one's RB (as the Steam Frame's bumpers, real presses).
+    static constexpr const char* kIndexControllerProfile = "/interaction_profiles/valve/index_controller";
+    static inline std::vector<InteractionBinding> s_index_bindings {
+        {"/user/hand/left/input/trackpad/force", "trackpadforce"},
+        {"/user/hand/right/input/trackpad/force", "trackpadforce"},
     };
 };
 }
