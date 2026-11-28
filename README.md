@@ -140,6 +140,8 @@ there, copy them into the game folder by hand.
 ### 4. Game settings
 
 - **Frame Generation: off.** It is not supported.
+- Set to windowed mode(Full Screen will result in Black Screen)
+- If using Pimax:Disable Passthrough(Passthrough will result in Black Screen)
 - DLSS is recommended (see Requirements).
 - Using the gun sight? Turn the game's own crosshair off (Settings > Interface).
 - Keep the game's controller vibration on if you want to feel hits and explosions.
